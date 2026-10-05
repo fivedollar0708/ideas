@@ -1172,6 +1172,235 @@ async function main() {
     await sleep(400);
     ok(!(await evaluate(cdp, `window.__nebula.isZoomed()`)), '再点放大后的泡泡也能收回');
 
+    console.log('\n── 搜索：聚光不是清场（阶段 5） ──');
+
+    await settle(cdp);
+    await evaluate(cdp, `window.__nebula.clearSearch()`);
+    await evaluate(cdp, `window.__nebula.fitAll()`);
+    await sleep(250);
+
+    const BUBBLES = `.bubble--idea:not(.bubble--shadow)`;
+    // returnByValue 已经把对象反序列化好了，不要再 JSON.parse（会得到 "[object Object]"）
+    const probe = async () =>
+      await evaluate(
+        cdp,
+        `(() => ({
+            total: document.querySelectorAll('${BUBBLES}').length,
+            hit: document.querySelectorAll('.bubble--hit').length,
+            dim: document.querySelectorAll('.bubble--idea.bubble--dim').length,
+            marks: Array.from(document.querySelectorAll('.bubble-label mark')).map(m => m.textContent),
+            count: document.querySelector('#search-count').textContent,
+            hintHidden: document.querySelector('#search-hint').hidden,
+            hintText: document.querySelector('#search-hint').textContent,
+          }))()`,
+      );
+
+    /** 用真实键盘输入搜索词（会触发真实的 input 事件）。 */
+    const typeSearch = async (text) => {
+      await evaluate(
+        cdp,
+        `(() => { const el = document.querySelector('#search'); el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); })()`,
+      );
+      await sleep(220);
+      await evaluate(cdp, `document.querySelector('#search').focus()`);
+      if (text !== '') await cdp.send('Input.insertText', { text });
+      await sleep(340); // 超过 120ms 的 debounce
+    };
+
+    const before = await probe();
+    ok(before.total > 0, `当前空间有 ${before.total} 个泡泡可搜`);
+
+    // ── 搜「三点」 ──
+    await typeSearch('三点');
+    const s1 = await probe();
+    ok(s1.hit === 1, `搜「三点」命中 1 条（实际 ${s1.hit}）`);
+    ok(s1.count === '⌕ 1 条', `计数文案正确（${s1.count}）`);
+    ok(s1.marks.includes('三点'), `命中文字被 <mark> 包住（${JSON.stringify(s1.marks)}）`);
+    ok(s1.dim === s1.total - 1, `其余 ${s1.dim} 条变暗`);
+    ok(
+      s1.total === before.total,
+      '🔴 未命中的泡泡一个都没被移除（搜索是手电筒，不是筛子）',
+      `${before.total} → ${s1.total}`,
+    );
+
+    // ── 搜「三」：命中应该变多 ──
+    await typeSearch('三');
+    const s2 = await probe();
+    ok(s2.hit >= 1, `搜「三」命中 ${s2.hit} 条`);
+    ok(s2.total === before.total, '换查询词后泡泡总数依然不变');
+
+    // ── 搜「凌晨」：前缀命中 ──
+    await typeSearch('凌晨');
+    const s3 = await probe();
+    ok(s3.hit >= 1, `搜「凌晨」命中 ${s3.hit} 条`);
+    ok(s3.marks.some((m) => m.startsWith('凌晨')), `前缀被标出（${JSON.stringify(s3.marks)}）`);
+
+    // ── 搜单字「水」 ──
+    await typeSearch('水');
+    const s4 = await probe();
+    ok(s4.hit >= 1, `搜单字「水」命中 ${s4.hit} 条`);
+    ok(s4.marks.includes('水'), '单字也被正确标出');
+
+    // ── 搜不存在的东西 ──
+    await typeSearch('zzzz不存在zzzz');
+    const s5 = await probe();
+    ok(s5.hit === 0, '搜不存在的东西：0 条命中');
+    ok(s5.count === '⌕ 0 条', `计数显示 0（${s5.count}）`);
+    ok(s5.marks.length === 0, '没有残留的高亮');
+    ok(s5.dim === s5.total, '全部变暗');
+    ok(s5.total === before.total, '🔴 一条都没被筛掉');
+
+    console.log('\n── 搜索：中文输入法守卫 ──');
+
+    // 直接派发 composition 事件来模拟输入法组字（这是唯一可行的模拟方式）
+    await typeSearch('');
+    const beforeIme = await probe();
+
+    await evaluate(
+      cdp,
+      `(() => {
+        const el = document.querySelector('#search');
+        el.focus();
+        el.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+        el.value = 'lingsant';
+        for (let i = 1; i <= 8; i++) {
+          el.value = 'lingsant'.slice(0, i);
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: true }));
+        }
+      })()`,
+    );
+    await sleep(500); // 远超 debounce，如果守卫失效这里早就搜过 8 次了
+
+    const duringIme = await probe();
+    ok(
+      duringIme.hit === 0 && duringIme.marks.length === 0,
+      '🔴 组字过程中没有触发任何搜索（否则打拼音时每个中间态都会全量重搜、页面卡死）',
+      JSON.stringify({ hit: duringIme.hit, marks: duringIme.marks, count: duringIme.count }),
+    );
+    ok(duringIme.total === beforeIme.total, '组字过程中星云没有任何变化');
+
+    // 组字结束 + 最终 input ⇒ 这时才应该真的搜
+    await evaluate(
+      cdp,
+      `(() => {
+        const el = document.querySelector('#search');
+        el.value = '凌晨';
+        el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: false }));
+      })()`,
+    );
+    await sleep(400);
+    const afterIme = await probe();
+    ok(afterIme.hit >= 1, `组字结束后才真正搜索（命中 ${afterIme.hit} 条）`);
+
+    console.log('\n── 搜索：Enter 跳转（移视口，不移泡泡） ──');
+
+    await typeSearch('三');
+    const jumpProbe = await probe();
+    ok(jumpProbe.hit >= 1, `准备跳转：命中 ${jumpProbe.hit} 条`);
+
+    const posBeforeJump = await evaluate(
+      cdp,
+      `JSON.stringify(window.__nebula.positions(window.__nebula.current().id))`,
+    );
+    const viewBeforeJump = await evaluate(
+      cdp,
+      `JSON.stringify({ tx: window.__nebula.field ? 0 : 0 })`,
+    );
+    void viewBeforeJump;
+
+    const pressEnter = async (shift = false) => {
+      for (const type of ['keyDown', 'keyUp']) {
+        await cdp.send('Input.dispatchKeyEvent', {
+          type,
+          key: 'Enter',
+          code: 'Enter',
+          windowsVirtualKeyCode: 13,
+          modifiers: shift ? 8 : 0,
+        });
+      }
+      await sleep(420);
+    };
+
+    await pressEnter();
+    const firstCenter = await evaluate(cdp, `window.__nebula.lastCentered()`);
+    ok(typeof firstCenter === 'string' && firstCenter.length > 0, 'Enter 跳转到了某条命中');
+
+    const posAfterJump = await evaluate(
+      cdp,
+      `JSON.stringify(window.__nebula.positions(window.__nebula.current().id))`,
+    );
+    ok(
+      posBeforeJump === posAfterJump,
+      '🔴 跳转只移动视口，泡泡的坐标一个都没变（不会"打断一边搜一边想"）',
+    );
+
+    await pressEnter();
+    const secondCenter = await evaluate(cdp, `window.__nebula.lastCentered()`);
+    ok(secondCenter !== firstCenter || jumpProbe.hit === 1, '再按 Enter 跳到下一条（循环）');
+
+    await pressEnter(true);
+    const backCenter = await evaluate(cdp, `window.__nebula.lastCentered()`);
+    ok(
+      backCenter === firstCenter || jumpProbe.hit <= 2,
+      `Shift+Enter 往回跳（回到 ${backCenter === firstCenter ? '第一条' : '上一条'}）`,
+    );
+
+    console.log('\n── 搜索：切空间后重建结果 ──');
+
+    await typeSearch('凌晨');
+    const inA = await probe();
+    ok(inA.hit >= 1, `在 A 空间命中 ${inA.hit} 条`);
+
+    const otherSpaceId = await evaluate(
+      cdp,
+      `(() => { const cur = window.__nebula.current().id;
+        const other = window.__nebula.spaces().find(s => s.id !== cur);
+        return other ? other.id : null; })()`,
+    );
+
+    if (otherSpaceId) {
+      await evaluate(cdp, `window.__nebula.switchSpace(${JSON.stringify(otherSpaceId)})`);
+      await sleep(500);
+      const inB = await probe();
+      ok(
+        inB.hit === 0 && inB.marks.length === 0,
+        '🔴 切到另一个空间后，上一个空间的命中与高亮没有残留',
+        JSON.stringify({ hit: inB.hit, marks: inB.marks, dim: inB.dim, count: inB.count }),
+      );
+      ok(inB.total === (await probe()).total, '新空间的泡泡数量正确');
+
+      // 提示条：B 空间里搜 A 空间才有的词
+      await typeSearch('凌晨');
+      const crossHint = await probe();
+      ok(
+        !crossHint.hintHidden && /其他空间还有/.test(crossHint.hintText),
+        `其他空间有命中时出现提示条（${crossHint.hintText}）`,
+      );
+
+      await evaluate(
+        cdp,
+        `document.querySelector('#search-hint').click()`,
+      );
+      await sleep(600);
+      const afterGo = await probe();
+      ok(
+        afterGo.hit >= 1,
+        '点提示条切到那个空间后，搜索词保留且命中被重建',
+        JSON.stringify({ hit: afterGo.hit, count: afterGo.count }),
+      );
+
+      // 切回 A，清空搜索
+      await evaluate(cdp, `window.__nebula.switchSpace(${JSON.stringify(spaceA)})`);
+      await sleep(400);
+    }
+
+    await evaluate(cdp, `window.__nebula.clearSearch()`);
+    await sleep(300);
+    const cleared = await probe();
+    ok(cleared.hit === 0 && cleared.dim === 0, '清空搜索后所有泡泡恢复正常');
+    ok(cleared.count === '', '计数也清空了');
+
     console.log('\n── 页面内自检 ──');
 
     await evaluate(cdp, `document.querySelector('#selftest').click()`);

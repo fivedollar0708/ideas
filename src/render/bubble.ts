@@ -100,10 +100,12 @@ export interface BubbleView {
   el: HTMLDivElement;
   /** 中间层：只负责缩放。 */
   scale: HTMLDivElement;
-  /** 内层：视觉与入场动画。 */
+  /** 内层：视觉。 */
   inner: HTMLDivElement;
+  /** 文字容器。搜索高亮要往里塞 <mark>，所以要暴露出来。 */
+  label: HTMLElement;
   body: Body;
-  /** 这个泡泡上的文本。放大动画要用它重建克隆体，省得回头去 DOM 里捞。 */
+  /** 这个泡泡上的文本。放大动画与搜索都要用它，省得回头去 DOM 里捞。 */
   text: string;
   destroy(): void;
 }
@@ -131,6 +133,22 @@ function makeShell(): { el: HTMLDivElement; scale: HTMLDivElement; inner: HTMLDi
 /** 标记"这个泡泡正在被拖拽"，用来关掉 hover 效果（否则会一边拖一边胀大）。 */
 export function setDragging(view: BubbleView, dragging: boolean): void {
   view.el.classList.toggle('bubble--dragging', dragging);
+}
+
+/**
+ * 搜索命中态。
+ *
+ * 🔴 未命中只是加 `bubble--dim`（CSS 里只改 opacity），**绝不把泡泡移走或删掉** ——
+ *    筛选会让星云从"一片海"缩成"几个点"，而版图本身就是这个产品的意义。
+ */
+export function setSearchState(view: BubbleView, hit: boolean): void {
+  view.el.classList.toggle('bubble--hit', hit);
+  view.el.classList.toggle('bubble--dim', !hit);
+}
+
+/** 清空搜索状态（恢复全貌）。 */
+export function clearSearchState(view: BubbleView): void {
+  view.el.classList.remove('bubble--hit', 'bubble--dim');
 }
 
 /** 暂时隐藏 / 显示一个泡泡（放大到中央时用）。 */
@@ -189,7 +207,7 @@ export function createIdeaBubble(
   inner.style.setProperty('--lines', String(fitLines(ry)));
   inner.appendChild(label);
 
-  const view: BubbleView = { el, scale, inner, body, text, destroy: () => {} };
+  const view: BubbleView = { el, scale, inner, label, body, text, destroy: () => {} };
   const unbind = bindHandlers(view, handlers);
   view.destroy = () => {
     unbind();
@@ -239,7 +257,7 @@ export function createHeartBubble(
   inner.appendChild(hint);
 
   // 心泡泡的 text 就是空间名（放大动画理论上不会作用在它身上，但保持一致）
-  const view: BubbleView = { el, scale, inner, body, text: name, destroy: () => {} };
+  const view: BubbleView = { el, scale, inner, label, body, text: name, destroy: () => {} };
   const unbind = bindHandlers(view, handlers);
   view.destroy = () => {
     unbind();

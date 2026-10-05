@@ -15,6 +15,7 @@ import { runForceTests } from './force';
 import { runSpaceRulesTests } from './spaceRules';
 import { runDragTests } from './drag';
 import { runAnimTests } from './anim';
+import { runSearchTests } from './search';
 import { summary } from './assert';
 
 runRngTests();
@@ -23,6 +24,7 @@ runForceTests();
 runSpaceRulesTests();
 runDragTests();
 runAnimTests();
+runSearchTests();
 
 const result = summary();
 

@@ -539,6 +539,31 @@
     root.style.setProperty("--font-size", `${FONT_SIZE}px`);
     remeasureFont();
   }
+  var SCORE_EXACT = 1e3;
+  var SCORE_PREFIX = 500;
+  var SCORE_SUBSTRING = 200;
+  var SCORE_POSITION_PENALTY_MAX = 150;
+  var SCORE_CHARSET_MAX = 20;
+  function scoreMatch(text, query) {
+    if (query === "") return 0;
+    const t = text.toLowerCase();
+    const q = query.toLowerCase();
+    if (t === q) return SCORE_EXACT;
+    if (t.startsWith(q)) return SCORE_PREFIX;
+    const at = t.indexOf(q);
+    if (at >= 0) {
+      return SCORE_SUBSTRING - Math.min(SCORE_POSITION_PENALTY_MAX, at);
+    }
+    const chars = /* @__PURE__ */ new Set();
+    for (const ch of q) chars.add(ch);
+    if (chars.size === 0) return 0;
+    let hit = 0;
+    for (const ch of chars) {
+      if (t.includes(ch)) hit++;
+    }
+    if (hit === 0) return 0;
+    return hit / chars.size * SCORE_CHARSET_MAX;
+  }
 
   // src/render/bubble.ts
   var HUE_ACCENTS = [
@@ -607,6 +632,13 @@
   function setDragging(view, dragging) {
     view.el.classList.toggle("bubble--dragging", dragging);
   }
+  function setSearchState(view, hit) {
+    view.el.classList.toggle("bubble--hit", hit);
+    view.el.classList.toggle("bubble--dim", !hit);
+  }
+  function clearSearchState(view) {
+    view.el.classList.remove("bubble--hit", "bubble--dim");
+  }
   function setHidden(view, hidden) {
     view.el.classList.toggle("bubble--hidden", hidden);
   }
@@ -641,7 +673,7 @@
     label.style.fontSize = `${FONT_SIZE}px`;
     inner.style.setProperty("--lines", String(fitLines(ry)));
     inner.appendChild(label);
-    const view = { el, scale, inner, body, text, destroy: () => {
+    const view = { el, scale, inner, label, body, text, destroy: () => {
     } };
     const unbind = bindHandlers(view, handlers);
     view.destroy = () => {
@@ -671,7 +703,7 @@
     hint.textContent = "\u5207\u6362\u7A7A\u95F4";
     inner.appendChild(label);
     inner.appendChild(hint);
-    const view = { el, scale, inner, body, text: name, destroy: () => {
+    const view = { el, scale, inner, label, body, text: name, destroy: () => {
     } };
     const unbind = bindHandlers(view, handlers);
     view.destroy = () => {
@@ -1492,6 +1524,218 @@
     };
   }
 
+  // src/ui/search.ts
+  var SEARCH_DEBOUNCE_MS = 120;
+  var JUMP_IDLE_MS = 4e3;
+  function splitByQuery(text, query) {
+    if (text === "") return [{ text: "", hit: false }];
+    if (query === "") return [{ text, hit: false }];
+    const lowerText = text.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+    const out = [];
+    let cursor = 0;
+    for (; ; ) {
+      const at = lowerText.indexOf(lowerQuery, cursor);
+      if (at < 0) break;
+      if (at > cursor) out.push({ text: text.slice(cursor, at), hit: false });
+      out.push({ text: text.slice(at, at + query.length), hit: true });
+      cursor = at + query.length;
+    }
+    if (out.length > 0) {
+      if (cursor < text.length) out.push({ text: text.slice(cursor), hit: false });
+      return out;
+    }
+    const wanted = /* @__PURE__ */ new Set();
+    for (const ch of lowerQuery) wanted.add(ch);
+    let hasAny = false;
+    for (const ch of text) {
+      if (wanted.has(ch.toLowerCase())) hasAny = true;
+    }
+    if (!hasAny) return [{ text, hit: false }];
+    let buffer = "";
+    let bufferHit = false;
+    const flush = () => {
+      if (buffer !== "") out.push({ text: buffer, hit: bufferHit });
+      buffer = "";
+    };
+    for (const ch of text) {
+      const hit = wanted.has(ch.toLowerCase());
+      if (hit !== bufferHit && buffer !== "") flush();
+      bufferHit = hit;
+      buffer += ch;
+    }
+    flush();
+    return out.length > 0 ? out : [{ text, hit: false }];
+  }
+  function planReconcile(existing, segments) {
+    return segments.map((seg, i) => {
+      const node = existing[i];
+      if (!node) return false;
+      const wantTag = seg.hit ? "MARK" : "#text";
+      return node.tag === wantTag && node.text === seg.text;
+    });
+  }
+  function rankMatches(items, query) {
+    if (query === "") return [];
+    const scored = items.map((item, index) => ({ id: item.id, score: scoreMatch(item.text, query), index })).filter((m) => m.score > 0);
+    scored.sort((a, b) => b.score !== a.score ? b.score - a.score : a.index - b.index);
+    return scored.map((m) => ({ id: m.id, score: m.score }));
+  }
+  function stepIndex(current, total, backward) {
+    if (total <= 0) return -1;
+    if (current < 0) return backward ? total - 1 : 0;
+    return backward ? (current - 1 + total) % total : (current + 1) % total;
+  }
+  function countLabel(hits, query) {
+    if (query === "") return "";
+    return `\u2315 ${hits} \u6761`;
+  }
+  function otherSpaceHint(spaceName, count) {
+    return `\u5176\u4ED6\u7A7A\u95F4\u8FD8\u6709 ${count} \u6761\u547D\u4E2D \xB7 \u53BB\u300C${spaceName}\u300D\u770B\u770B`;
+  }
+  function pulseKeyframes() {
+    return [
+      { transform: "scale(1)", offset: 0 },
+      { transform: "scale(1.14)", offset: 0.35 },
+      { transform: "scale(1)", offset: 1 }
+    ];
+  }
+  function shapeOfNode(node) {
+    return {
+      tag: node.nodeType === Node.TEXT_NODE ? "#text" : node.tagName,
+      text: node.textContent ?? ""
+    };
+  }
+  function renderSegments(label, segments) {
+    const nodes = Array.from(label.childNodes);
+    const existing = nodes.map(shapeOfNode);
+    const reuse = planReconcile(existing, segments);
+    let touched = false;
+    for (let i = existing.length - 1; i >= segments.length; i--) {
+      nodes[i]?.remove();
+      touched = true;
+    }
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const seg = segments[i];
+      const node = label.childNodes[i];
+      if (reuse[i] && node) continue;
+      const next = seg.hit ? document.createElement("mark") : document.createTextNode("");
+      next.textContent = seg.text;
+      if (node) label.replaceChild(next, node);
+      else label.appendChild(next);
+      touched = true;
+    }
+    return touched;
+  }
+  function mountSearch(input, countEl, hintEl, host) {
+    let query = "";
+    let hits = [];
+    let jumpIndex = -1;
+    let lastJumpAt = 0;
+    let composing = false;
+    let timer = 0;
+    let generation = 0;
+    function applyState() {
+      const targets = host.targets();
+      if (query === "") {
+        host.clear();
+        countEl.textContent = "";
+        hintEl.hidden = true;
+        return;
+      }
+      hits = rankMatches(targets, query);
+      const hitIds = new Set(hits.map((h) => h.id));
+      host.apply(
+        targets.map((t) => ({ id: t.id, hit: hitIds.has(t.id) })),
+        query
+      );
+      countEl.textContent = countLabel(hits.length, query);
+      const gen = generation;
+      void host.otherSpaceMatches(query).then((others) => {
+        if (gen !== generation) return;
+        if (others.length === 0) {
+          hintEl.hidden = true;
+          return;
+        }
+        const total = others.reduce((sum, o) => sum + o.count, 0);
+        hintEl.textContent = otherSpaceHint(others[0].name, total);
+        hintEl.dataset.spaceId = others[0].spaceId;
+        hintEl.hidden = false;
+      }).catch(() => {
+        hintEl.hidden = true;
+      });
+    }
+    function run() {
+      if (composing) return;
+      generation++;
+      query = input.value.trim();
+      jumpIndex = -1;
+      applyState();
+    }
+    function schedule() {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(run, SEARCH_DEBOUNCE_MS);
+    }
+    function onInput(e) {
+      if (composing || e.isComposing) return;
+      schedule();
+    }
+    function onCompositionStart() {
+      composing = true;
+    }
+    function onCompositionEnd() {
+      composing = false;
+      schedule();
+    }
+    function onKeyDown(e) {
+      if (e.key !== "Enter") return;
+      if (composing || e.isComposing || e.keyCode === 229) return;
+      if (hits.length === 0) return;
+      e.preventDefault();
+      const now = performance.now();
+      if (now - lastJumpAt > JUMP_IDLE_MS) jumpIndex = -1;
+      lastJumpAt = now;
+      jumpIndex = stepIndex(jumpIndex, hits.length, e.shiftKey);
+      const target = hits[jumpIndex];
+      if (!target) return;
+      host.centerOn(target.id);
+      host.pulse(target.id);
+    }
+    function clear() {
+      window.clearTimeout(timer);
+      input.value = "";
+      query = "";
+      hits = [];
+      jumpIndex = -1;
+      generation++;
+      host.clear();
+      countEl.textContent = "";
+      hintEl.hidden = true;
+    }
+    input.addEventListener("input", onInput);
+    input.addEventListener("compositionstart", onCompositionStart);
+    input.addEventListener("compositionend", onCompositionEnd);
+    input.addEventListener("keydown", onKeyDown);
+    hintEl.addEventListener("click", () => {
+      const spaceId = hintEl.dataset.spaceId;
+      if (spaceId) host.goToSpace(spaceId);
+    });
+    return {
+      refresh: () => {
+        generation++;
+        query = input.value.trim();
+        applyState();
+      },
+      clear,
+      get query() {
+        return query;
+      },
+      get hitCount() {
+        return hits.length;
+      }
+    };
+  }
+
   // src/ui/spaceLayer.ts
   var SpaceLayer = class {
     root;
@@ -1861,6 +2105,19 @@
     drag = null;
     /** 当前打开的放大态。同一时刻只允许一个。 */
     zoom = null;
+    /** 搜索控制器。在构造函数里挂上，openSpace 之前就存在。 */
+    search = null;
+    searchInput;
+    searchHint;
+    /** 每个泡泡上一次渲染高亮用的查询词 —— 没变就完全不碰 DOM（避免闪烁）。 */
+    markQuery = /* @__PURE__ */ new Map();
+    /** 跨空间搜索用的全量想法缓存。任何数据变动都要置脏。 */
+    searchCache = null;
+    searchDirty = true;
+    /** 视口补间的句柄（Enter 跳转时把命中的那条移到屏幕中央）。 */
+    viewportAnim = 0;
+    /** 最近一次被"居中"的泡泡 id（自动化测试用）。 */
+    lastCenteredId = null;
     /**
      * 拖拽过、但还没把最终坐标写回数据库的 idea。
      * 值是该位置的"被放下时刻"（写进 movedAt，不是写入时刻 —— 两者差几百毫秒，
@@ -1892,6 +2149,126 @@
       this.bindViewportGestures();
       this.mountDragController();
       this.bindLifecycleFlush();
+      this.searchInput = must("#search");
+      this.searchHint = must("#search-hint");
+      this.bindSearch();
+    }
+    // ── 搜索：聚光，不是清场 ──────────────────────────────
+    bindSearch() {
+      this.search = mountSearch(
+        this.searchInput,
+        must("#search-count"),
+        this.searchHint,
+        {
+          targets: () => [...this.views.values()].map((v) => ({ id: v.body.id, text: v.text })),
+          apply: (states, query) => {
+            if (this.heartView) setSearchState(this.heartView, false);
+            for (const state of states) {
+              const view = this.views.get(state.id);
+              if (!view) continue;
+              setSearchState(view, state.hit);
+              this.syncLabel(view, query, state.hit);
+            }
+          },
+          clear: () => {
+            if (this.heartView) clearSearchState(this.heartView);
+            for (const view of this.views.values()) {
+              clearSearchState(view);
+              this.syncLabel(view, "", false);
+            }
+          },
+          centerOn: (id) => this.centerOn(id),
+          pulse: (id) => this.pulse(id),
+          otherSpaceMatches: (query) => this.otherSpaceMatches(query),
+          goToSpace: (spaceId) => {
+            void this.switchSpace(spaceId).then(() => this.searchInput.focus());
+          }
+        }
+      );
+    }
+    /**
+     * 把高亮同步到 label 上。
+     *
+     * 🔴 查询词没变就**完全不碰 DOM**（`markQuery` 缓存）—— 搜索是边打边看的过程，
+     *    每敲一个字都重建整段文字会让它闪一下，非常干扰。
+     *    真正变化的往往只是多标一个字，renderSegments 内部还会复用形状相同的节点。
+     */
+    syncLabel(view, query, hit) {
+      const id = view.body.id;
+      if (this.markQuery.get(id) === query) return;
+      this.markQuery.set(id, query);
+      const segments = hit ? splitByQuery(view.text, query) : [{ text: view.text, hit: false }];
+      renderSegments(view.label, segments);
+    }
+    /** 把某个泡泡移到屏幕中央。**移动视口，不动泡泡。** */
+    centerOn(id) {
+      const view = this.views.get(id);
+      if (!view) return;
+      const rect = this.stage.getBoundingClientRect();
+      const scale = this.viewport.scale;
+      this.lastCenteredId = id;
+      this.tweenViewport(
+        {
+          scale,
+          tx: rect.width / 2 - view.body.x * scale,
+          ty: rect.height / 2 - view.body.y * scale
+        },
+        260
+      );
+    }
+    tweenViewport(target, ms) {
+      cancelAnimationFrame(this.viewportAnim);
+      const from = { ...this.viewport };
+      const t0 = performance.now();
+      const step = () => {
+        const k = Math.min(1, (performance.now() - t0) / ms);
+        const eased = 1 - (1 - k) ** 3;
+        this.viewport = {
+          scale: target.scale,
+          tx: from.tx + (target.tx - from.tx) * eased,
+          ty: from.ty + (target.ty - from.ty) * eased
+        };
+        this.applyViewport();
+        if (k < 1) {
+          this.viewportAnim = requestAnimationFrame(step);
+        } else {
+          void this.saveViewportNow();
+        }
+      };
+      this.viewportAnim = requestAnimationFrame(step);
+    }
+    pulse(id) {
+      const view = this.views.get(id);
+      if (!view) return;
+      view.scale.animate(pulseKeyframes(), { duration: 340, easing: "ease-out" });
+    }
+    /** 全量想法（跨空间搜索用）。带缓存，任何数据变动都会置脏。 */
+    async allIdeas() {
+      if (this.searchCache && !this.searchDirty) return this.searchCache;
+      this.searchCache = await this.store.getAllIdeas();
+      this.searchDirty = false;
+      return this.searchCache;
+    }
+    markSearchDirty() {
+      this.searchDirty = true;
+    }
+    async otherSpaceMatches(query) {
+      if (query === "") return [];
+      const currentId = this.current?.id;
+      const all = await this.allIdeas();
+      const counts = /* @__PURE__ */ new Map();
+      for (const idea of all) {
+        if (idea.spaceId === currentId) continue;
+        if (idea.archived === 1) continue;
+        if (scoreMatch(idea.text, query) > 0) {
+          counts.set(idea.spaceId, (counts.get(idea.spaceId) ?? 0) + 1);
+        }
+      }
+      return [...counts.entries()].map(([spaceId, count]) => ({
+        spaceId,
+        count,
+        name: this.spaces.find((sp) => sp.id === spaceId)?.name ?? "\uFF08\u5DF2\u5220\u9664\u7684\u7A7A\u95F4\uFF09"
+      })).sort((a, b) => b.count - a.count);
     }
     // ── 拖拽 ──────────────────────────────────────────────
     mountDragController() {
@@ -2045,6 +2422,7 @@
       if (body.fixed) return;
       body.pinned = !body.pinned;
       setPinned(view, body.pinned);
+      this.markSearchDirty();
       this.field.wake(0.35);
       this.startLoop();
       void this.savePinned(body.id, body.pinned);
@@ -2168,6 +2546,7 @@
       this.kick();
       this.writeAll();
       this.updateStatusLine();
+      this.search?.refresh();
     }
     /**
      * 由想法记录造一个 body。
@@ -2403,6 +2782,7 @@
       );
       if (!confirmed) return;
       await this.store.deleteSpaceToTrash(spaceId);
+      this.markSearchDirty();
       this.spaces = await this.store.getAllSpaces();
       if (this.current?.id === spaceId) {
         await this.openSpace(this.spaces[0], { ignoreSaved: true });
@@ -2420,6 +2800,7 @@
     async restoreTrash(trashId) {
       const restored = await this.store.restoreFromTrash(trashId);
       if (!restored) return;
+      this.markSearchDirty();
       this.spaces = await this.store.getAllSpaces();
       this.trashLayer.render(await this.store.getAllTrash());
       this.spaceLayer.render(this.spaces);
@@ -2460,6 +2841,7 @@
       };
       await this.store.putIdea(idea);
       const body = this.bodyFromIdea(idea);
+      this.markSearchDirty();
       void this.launchFlight(idea, body, space);
       this.updateStatusLine();
     }
@@ -2558,6 +2940,16 @@
         isZoomed: () => this.zoom !== null,
         /** 关掉放大态（测试用）。 */
         closeZoom: () => this.closeZoom(),
+        /** 搜索状态（查询词与命中数）。 */
+        searchState: () => ({
+          query: this.search?.query ?? "",
+          hits: this.search?.hitCount ?? 0,
+          input: this.searchInput.value
+        }),
+        /** 最近一次被"居中"的泡泡 id —— 验证 Enter 跳转是移视口而不是移泡泡。 */
+        lastCentered: () => this.lastCenteredId,
+        /** 清空搜索（恢复全貌）。 */
+        clearSearch: () => this.search?.clear(),
         /** 把待写回的位置立刻落库（测试与关页面前用）。 */
         flushPositions: () => this.flushPositions(true),
         /**

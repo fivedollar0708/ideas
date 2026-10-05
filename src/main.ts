@@ -16,11 +16,13 @@ import { mountDrag, type DragHandle } from './interact/drag';
 import { ForceField, type Body } from './physics/force';
 import {
   applyAccent,
+  clearSearchState,
   createHeartBubble,
   createIdeaBubble,
   setDragging,
   setHidden,
   setPinned,
+  setSearchState,
   updateHeartLabel,
   writePosition,
   type BubbleView,
@@ -29,8 +31,16 @@ import { flyIn, getLastFlight, playPop } from './render/flyIn';
 import { getLastZoom, openZoom, type ZoomHandle } from './render/zoom';
 import { makeRng, newId } from './rng';
 import { NebulaStore } from './store';
-import { installFontStackVar, radiusOfCached } from './text';
+import { installFontStackVar, radiusOfCached, scoreMatch } from './text';
 import { mountInput, type NoticeKind } from './ui/input';
+import {
+  mountSearch,
+  pulseKeyframes,
+  renderSegments,
+  splitByQuery,
+  type OtherSpaceMatch,
+  type SearchHandle,
+} from './ui/search';
 import { SpaceLayer } from './ui/spaceLayer';
 import { TrashLayer } from './ui/trash';
 import {
@@ -125,6 +135,20 @@ class App {
   /** 当前打开的放大态。同一时刻只允许一个。 */
   private zoom: ZoomHandle | null = null;
 
+  /** 搜索控制器。在构造函数里挂上，openSpace 之前就存在。 */
+  private search: SearchHandle | null = null;
+  private readonly searchInput: HTMLInputElement;
+  private readonly searchHint: HTMLButtonElement;
+  /** 每个泡泡上一次渲染高亮用的查询词 —— 没变就完全不碰 DOM（避免闪烁）。 */
+  private readonly markQuery = new Map<string, string>();
+  /** 跨空间搜索用的全量想法缓存。任何数据变动都要置脏。 */
+  private searchCache: Idea[] | null = null;
+  private searchDirty = true;
+  /** 视口补间的句柄（Enter 跳转时把命中的那条移到屏幕中央）。 */
+  private viewportAnim = 0;
+  /** 最近一次被"居中"的泡泡 id（自动化测试用）。 */
+  private lastCenteredId: string | null = null;
+
   /**
    * 拖拽过、但还没把最终坐标写回数据库的 idea。
    * 值是该位置的"被放下时刻"（写进 movedAt，不是写入时刻 —— 两者差几百毫秒，
@@ -161,6 +185,155 @@ class App {
     this.bindViewportGestures();
     this.mountDragController();
     this.bindLifecycleFlush();
+
+    this.searchInput = must<HTMLInputElement>('#search');
+    this.searchHint = must<HTMLButtonElement>('#search-hint');
+    this.bindSearch();
+  }
+
+  // ── 搜索：聚光，不是清场 ──────────────────────────────
+
+  private bindSearch(): void {
+    this.search = mountSearch(
+      this.searchInput,
+      must<HTMLElement>('#search-count'),
+      this.searchHint,
+      {
+        targets: () =>
+          [...this.views.values()].map((v) => ({ id: v.body.id, text: v.text })),
+
+        apply: (states, query) => {
+          // 心泡泡不是搜索结果。搜索时把它一起变暗 ——
+          // 否则它会成为画面里最亮的东西、被误当成命中（实测观感问题）
+          if (this.heartView) setSearchState(this.heartView, false);
+          for (const state of states) {
+            const view = this.views.get(state.id);
+            if (!view) continue;
+            setSearchState(view, state.hit);
+            this.syncLabel(view, query, state.hit);
+          }
+        },
+
+        clear: () => {
+          if (this.heartView) clearSearchState(this.heartView);
+          for (const view of this.views.values()) {
+            clearSearchState(view);
+            this.syncLabel(view, '', false);
+          }
+        },
+
+        centerOn: (id) => this.centerOn(id),
+        pulse: (id) => this.pulse(id),
+        otherSpaceMatches: (query) => this.otherSpaceMatches(query),
+        goToSpace: (spaceId) => {
+          // 用户主动点的，不是"自动飞过去"。搜索词保留，到了那边重建命中
+          void this.switchSpace(spaceId).then(() => this.searchInput.focus());
+        },
+      },
+    );
+  }
+
+  /**
+   * 把高亮同步到 label 上。
+   *
+   * 🔴 查询词没变就**完全不碰 DOM**（`markQuery` 缓存）—— 搜索是边打边看的过程，
+   *    每敲一个字都重建整段文字会让它闪一下，非常干扰。
+   *    真正变化的往往只是多标一个字，renderSegments 内部还会复用形状相同的节点。
+   */
+  private syncLabel(view: BubbleView, query: string, hit: boolean): void {
+    const id = view.body.id;
+    if (this.markQuery.get(id) === query) return;
+    this.markQuery.set(id, query);
+
+    const segments = hit
+      ? splitByQuery(view.text, query)
+      : [{ text: view.text, hit: false }];
+    renderSegments(view.label, segments);
+  }
+
+  /** 把某个泡泡移到屏幕中央。**移动视口，不动泡泡。** */
+  private centerOn(id: string): void {
+    const view = this.views.get(id);
+    if (!view) return;
+
+    const rect = this.stage.getBoundingClientRect();
+    const scale = this.viewport.scale;
+    this.lastCenteredId = id;
+
+    this.tweenViewport(
+      {
+        scale,
+        tx: rect.width / 2 - view.body.x * scale,
+        ty: rect.height / 2 - view.body.y * scale,
+      },
+      260,
+    );
+  }
+
+  private tweenViewport(target: Viewport, ms: number): void {
+    cancelAnimationFrame(this.viewportAnim);
+    const from = { ...this.viewport };
+    const t0 = performance.now();
+
+    const step = (): void => {
+      const k = Math.min(1, (performance.now() - t0) / ms);
+      const eased = 1 - (1 - k) ** 3; // ease-out cubic
+      this.viewport = {
+        scale: target.scale,
+        tx: from.tx + (target.tx - from.tx) * eased,
+        ty: from.ty + (target.ty - from.ty) * eased,
+      };
+      this.applyViewport();
+      if (k < 1) {
+        this.viewportAnim = requestAnimationFrame(step);
+      } else {
+        void this.saveViewportNow();
+      }
+    };
+
+    this.viewportAnim = requestAnimationFrame(step);
+  }
+
+  private pulse(id: string): void {
+    const view = this.views.get(id);
+    if (!view) return;
+    view.scale.animate(pulseKeyframes(), { duration: 340, easing: 'ease-out' });
+  }
+
+  /** 全量想法（跨空间搜索用）。带缓存，任何数据变动都会置脏。 */
+  private async allIdeas(): Promise<Idea[]> {
+    if (this.searchCache && !this.searchDirty) return this.searchCache;
+    this.searchCache = await this.store.getAllIdeas();
+    this.searchDirty = false;
+    return this.searchCache;
+  }
+
+  private markSearchDirty(): void {
+    this.searchDirty = true;
+  }
+
+  private async otherSpaceMatches(query: string): Promise<OtherSpaceMatch[]> {
+    if (query === '') return [];
+    const currentId = this.current?.id;
+    const all = await this.allIdeas();
+
+    const counts = new Map<string, number>();
+    for (const idea of all) {
+      if (idea.spaceId === currentId) continue;
+      // 归档的想法在当前星云里没有可高亮的泡泡，先不计入
+      if (idea.archived === 1) continue;
+      if (scoreMatch(idea.text, query) > 0) {
+        counts.set(idea.spaceId, (counts.get(idea.spaceId) ?? 0) + 1);
+      }
+    }
+
+    return [...counts.entries()]
+      .map(([spaceId, count]) => ({
+        spaceId,
+        count,
+        name: this.spaces.find((sp) => sp.id === spaceId)?.name ?? '（已删除的空间）',
+      }))
+      .sort((a, b) => b.count - a.count);
   }
 
   // ── 拖拽 ──────────────────────────────────────────────
@@ -343,6 +516,7 @@ class App {
 
     body.pinned = !body.pinned;
     setPinned(view, body.pinned);
+    this.markSearchDirty();
 
     this.field.wake(0.35);
     this.startLoop();
@@ -501,6 +675,9 @@ class App {
     this.kick();
     this.writeAll();
     this.updateStatusLine();
+
+    // 🔴 切空间后必须重建搜索结果：视图全换了，不重建就会残留上一个空间的命中
+    this.search?.refresh();
   }
 
   /**
@@ -786,6 +963,7 @@ class App {
     if (!confirmed) return;
 
     await this.store.deleteSpaceToTrash(spaceId);
+    this.markSearchDirty();
     this.spaces = await this.store.getAllSpaces();
 
     if (this.current?.id === spaceId) {
@@ -810,6 +988,7 @@ class App {
     const restored = await this.store.restoreFromTrash(trashId);
     if (!restored) return;
 
+    this.markSearchDirty();
     this.spaces = await this.store.getAllSpaces();
     this.trashLayer.render(await this.store.getAllTrash());
     this.spaceLayer.render(this.spaces);
@@ -861,6 +1040,7 @@ class App {
     await this.store.putIdea(idea);
 
     const body = this.bodyFromIdea(idea);
+    this.markSearchDirty();
 
     // 刻意**不 await** 飞入：让输入框立刻空出来，用户能马上记下一条。
     // 真泡泡在飞完之后才出现（见 launchFlight）。
@@ -997,6 +1177,19 @@ class App {
 
       /** 关掉放大态（测试用）。 */
       closeZoom: () => this.closeZoom(),
+
+      /** 搜索状态（查询词与命中数）。 */
+      searchState: () => ({
+        query: this.search?.query ?? '',
+        hits: this.search?.hitCount ?? 0,
+        input: this.searchInput.value,
+      }),
+
+      /** 最近一次被"居中"的泡泡 id —— 验证 Enter 跳转是移视口而不是移泡泡。 */
+      lastCentered: () => this.lastCenteredId,
+
+      /** 清空搜索（恢复全貌）。 */
+      clearSearch: () => this.search?.clear(),
 
       /** 把待写回的位置立刻落库（测试与关页面前用）。 */
       flushPositions: () => this.flushPositions(true),

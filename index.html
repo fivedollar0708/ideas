@@ -17,6 +17,8 @@
        泡泡是它的绝对定位子元素，靠 overflow 溢出显示。
        这样"点空白"的 target 才会是 #stage，不会被子元素挡住。 -->
   <div id="world"></div>
+  <!-- 其他空间也有命中时的提示条（贴在星云边缘）。点它切过去，搜索词保留 -->
+  <button id="search-hint" class="search-hint" type="button" hidden></button>
 </div>
 
 <!-- 空间切换浮层 -->
@@ -52,6 +54,17 @@
     <span id="space-name" class="space-name">…</span>
     <span id="space-count" class="space-count">0 条</span>
   </p>
+  <div class="searchrow">
+    <input
+      id="search"
+      class="search-input"
+      type="search"
+      placeholder="⌕ 搜索想法…"
+      autocomplete="off"
+      spellcheck="false"
+      aria-label="搜索想法">
+    <span id="search-count" class="search-count" aria-live="polite"></span>
+  </div>
   <p id="notice" class="notice" role="status" aria-live="polite"></p>
   <textarea
     id="input"

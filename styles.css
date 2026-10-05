@@ -584,6 +584,113 @@ body {
   color: var(--text-faint);
 }
 
+/* ── 搜索：聚光，不是清场 ─────────────────────────────────
+ *
+ * 🔴 未命中的泡泡**只降透明度**，不移走、不删除、不改尺寸。
+ *    筛选会让星云从"一片海"缩成"几个点"，而版图本身就是这个产品的意义。
+ * 🔴 只用 opacity —— 绝不用 filter: blur()（几百个元素上挂 filter 会掉到个位数 fps）。
+ */
+
+.bubble--dim {
+  opacity: 0.16;
+  transition: opacity 160ms ease-out;
+}
+
+.bubble--hit .bubble-inner {
+  /* 边框提亮：从 1px 的淡色调描边变成 2px 实色 */
+  border: 2px solid var(--accent);
+  background: var(--accent-soft);
+}
+
+.bubble--hit .bubble-scale {
+  transform: scale(1.04);
+}
+
+/* 命中态下文字要清楚，不要"柔和" */
+.bubble--hit .bubble-label {
+  opacity: 1;
+  text-shadow: none;
+}
+
+/* 命中文字的高亮 */
+.bubble-label mark {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+/* 变暗的泡泡不该再有悬停放大效果（它已经不在聚光范围内了） */
+.bubble--dim:hover .bubble-scale {
+  transform: none;
+}
+
+.search-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  max-width: calc(100% - 32px);
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  box-shadow: 0 1px 2px rgba(44, 44, 42, 0.08);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.search-hint:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.searchrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 6px;
+}
+
+.search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.search-input::placeholder {
+  color: var(--text-faint);
+}
+
+/* 去掉 type=search 在 Chrome 里的那个叉（会和 Enter 跳转打架） */
+.search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+
+.search-count {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── 通用按钮与自检（自检是阶段 1 起就有的临时工具）──────── */
 
 .btn {
