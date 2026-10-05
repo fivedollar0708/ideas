@@ -1,0 +1,19 @@
+{
+  "name": "nebula",
+  "version": "0.1.0",
+  "private": true,
+  "description": "想法星云 — 一个人的灵感收集站（纯静态站，部署于 GitHub Pages）",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --format=iife --target=es2022 --outfile=app.js",
+    "watch": "esbuild src/main.ts --bundle --format=iife --target=es2022 --outfile=app.js --watch",
+    "serve": "esbuild src/main.ts --bundle --format=iife --target=es2022 --outfile=app.js --servedir=.",
+    "typecheck": "tsc --noEmit",
+    "test": "esbuild test/all.ts --bundle --format=iife --platform=node --target=es2022 --outfile=test/bundle.js && node test/bundle.js",
+    "smoke": "node scripts/smoke.mjs",
+    "check:secrets": "node scripts/check-secrets.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}
