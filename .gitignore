@@ -5,6 +5,7 @@
 # 白名单把这类风险从"可能发生"降成"必须显式放行才会发生"。
 *
 !.gitignore
+!.gitattributes
 !.nojekyll
 
 # —— 站点根目录 ——

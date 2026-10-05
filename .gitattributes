@@ -1,0 +1,16 @@
+# 行尾归一化。
+#
+# 为什么需要这个文件：本机是 Windows，git 默认会把文本文件的 LF 改成 CRLF。
+# 但 .bat/.cmd 文件必须是 CRLF（LF 行尾的 .bat 会被 cmd 解析乱，出现
+# "不是内部或外部命令"这类莫名报错），而 JS/TS/CSS 源码用 LF 更干净。
+
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，别动
+*.png binary
+*.jpg binary
+*.woff2 binary
