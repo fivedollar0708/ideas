@@ -37,8 +37,25 @@ export interface Body {
   ry: number;
   /** 心泡泡：钉死在原位，不受力、不积分，但仍参与碰撞（挡住别的泡泡）。 */
   fixed: boolean;
-  /** 用户双击锁定（阶段 3）：不受力、不积分，但可以被别的泡泡推动吗？不 —— 完全静止。 */
+  /** 用户双击锁定：不受力、不积分，但不被别的泡泡推动。 */
   pinned: boolean;
+  /**
+   * 正在被用户拖拽（阶段 3）。位置由指针直接决定，**引擎绝不能碰它的坐标** ——
+   * 这一条是"压着拖动不会一边拖一边抖"的全部秘密。
+   * 同时它仍作为碰撞体把周围泡泡推开（观感上像犁开星云）。
+   */
+  dragging: boolean;
+}
+
+/**
+ * 不可推动的泡泡。
+ *
+ * 三种情况在物理上是同一件事：**它的坐标不由力场决定**。
+ * 抽成一个函数是为了让"哪些泡泡引擎不许写"只有一个定义 —— 散布在四处判断
+ * 迟早会漏掉一处，而漏掉的表现就是"拖着拖着突然被弹开"。
+ */
+export function isImmovable(body: Body): boolean {
+  return body.fixed || body.pinned || body.dragging;
 }
 
 export interface ForceParams {
@@ -46,7 +63,7 @@ export interface ForceParams {
   repulsion: number;
   /** 向心系数。 */
   centering: number;
-  /** 每 tick 速度保留比例（抖动越小越"黏"）。 */
+  /** 每 tick 速度保留比例（越小越"黏"，甩出后滑得越短）。 */
   damping: number;
   /** 超出这个距离就互不施力。 */
   interactionRadius: number;
@@ -58,13 +75,29 @@ export interface ForceParams {
   alphaDecay: number;
   /** alpha 低于它就彻底停下（CPU 归零）。 */
   alphaMin: number;
-  /** 碰撞松弛强度 0..1，1 = 一帧内完全分开。 */
+  /** 碰撞松弛强度 0..1，越大分离得越干脆。 */
   collisionRelax: number;
+  /**
+   * 碰撞间距系数。1.0 = 允许相切；1.22 = 强制留出约 22% 的间隙。
+   *
+   * 🔴 为什么需要它（实测依据）：
+   *    向心力会一直把泡泡往里压，直到碰撞挡住它 —— 平衡态就是"全部挤到相切"。
+   *    20 条想法时实测归一化间隙中位数只有 0.038（≈4.5px），整片看起来像一坨泡沫，
+   *    而不是"漂浮的想法"。给碰撞体加一圈虚拟外扩，就能在**不减弱聚拢感**的前提下
+   *    强制留出呼吸空间。
+   *    间隙 = (系数 - 1) × 两个泡泡半径之和，所以大泡泡间隙大、小泡泡间隙小，比例自然。
+   */
+  collisionSpacing: number;
 }
 
 /**
- * 🔴 这些常数的量级是"起手值"，不是调好的值 —— 手感需要看着实物调。
+ * 🔴 这些常数的量级是"起手值 + 一轮实测校准"，不是最终值 —— 手感仍需要看着实物调。
  * 改这里就够了，不要散落到别处。
+ *
+ * 本轮校准的实测依据（20 条想法、1024×800 视口，稳定后测量）：
+ *   调前：归一化间隙中位数 0.038（≈4.5px）⇒ 泡泡几乎全部相切，像一坨泡沫
+ *   调后：见 scripts/../（用同法复测）中位数应接近 collisionSpacing - 1 ≈ 0.22
+ * 改动：collisionSpacing 从「无」加到 1.22；collisionRelax 0.62 → 0.8（分离更干脆）。
  */
 export const DEFAULT_PARAMS: ForceParams = {
   repulsion: 520000,
@@ -75,7 +108,8 @@ export const DEFAULT_PARAMS: ForceParams = {
   dt: 1 / 60,
   alphaDecay: 0.0225,
   alphaMin: 0.002,
-  collisionRelax: 0.62,
+  collisionRelax: 0.8,
+  collisionSpacing: 1.22,
 };
 
 export type Tier = 'full' | 'eco' | 'asleep';
@@ -200,7 +234,7 @@ export class ForceField {
 
     // ── ① 斥力 + ② 向心（累加进速度）──────────────────────
     for (const body of bodies) {
-      if (body.fixed || body.pinned) {
+      if (isImmovable(body)) {
         body.vx = 0;
         body.vy = 0;
         continue;
@@ -253,7 +287,7 @@ export class ForceField {
 
     // ── 积分 ────────────────────────────────────────────
     for (const body of bodies) {
-      if (body.fixed || body.pinned) continue;
+      if (isImmovable(body)) continue;
       body.x += body.vx * p.dt;
       body.y += body.vy * p.dt;
     }
@@ -268,9 +302,11 @@ export class ForceField {
     this.decayAlpha();
   }
 
-  /** 椭圆碰撞。fixed/pinned 的泡泡不动，只推开对方。 */
+  /** 椭圆碰撞。不可推动的泡泡不动，只推开对方。 */
   private resolveCollisions(bodies: Body[]): void {
     const relax = this.params.collisionRelax;
+    // 虚拟外扩：让泡泡之间强制留出呼吸空间，见 collisionSpacing 的注释
+    const spacing = this.params.collisionSpacing;
 
     for (const body of bodies) {
       for (const other of this.neighborsOf(body)) {
@@ -284,8 +320,8 @@ export class ForceField {
         //    扁椭圆的包围盒在左右两侧有大片空的区域，用包围盒判断会让两个泡泡
         //    明明看着离得很远却被推开，星云会显得稀稀拉拉。
         //    归一化距离把椭圆当成"单位圆经过缩放"，贴合实际形状。
-        const sumRx = body.rx + other.rx;
-        const sumRy = body.ry + other.ry;
+        const sumRx = (body.rx + other.rx) * spacing;
+        const sumRy = (body.ry + other.ry) * spacing;
         if (sumRx <= 0 || sumRy <= 0) continue;
 
         const nx = dx / sumRx;
@@ -311,8 +347,8 @@ export class ForceField {
         const pushX = ux * overlap * 0.5;
         const pushY = uy * overlap * 0.5;
 
-        const bodyMovable = !body.fixed && !body.pinned;
-        const otherMovable = !other.fixed && !other.pinned;
+        const bodyMovable = !isImmovable(body);
+        const otherMovable = !isImmovable(other);
 
         if (bodyMovable && otherMovable) {
           body.x -= pushX;

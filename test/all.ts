@@ -13,12 +13,14 @@ import { runRngTests } from './rng';
 import { runTextTests } from './text';
 import { runForceTests } from './force';
 import { runSpaceRulesTests } from './spaceRules';
+import { runDragTests } from './drag';
 import { summary } from './assert';
 
 runRngTests();
 runTextTests();
 runForceTests();
 runSpaceRulesTests();
+runDragTests();
 
 const result = summary();
 

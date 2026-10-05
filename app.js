@@ -1,5 +1,106 @@
 "use strict";
 (() => {
+  // src/interact/drag.ts
+  var DRAG_THRESHOLD_PX = 8;
+  var TAP_MAX_MS = 300;
+  var VELOCITY_WINDOW_MS = 90;
+  var MAX_SAMPLES = 24;
+  function classifyGesture(samples, thresholdPx = DRAG_THRESHOLD_PX, tapMaxMs = TAP_MAX_MS) {
+    if (samples.length < 2) return "tap";
+    const first = samples[0];
+    const last = samples[samples.length - 1];
+    const moved = Math.hypot(last.x - first.x, last.y - first.y);
+    const elapsed = last.t - first.t;
+    return moved > thresholdPx || elapsed > tapMaxMs ? "drag" : "tap";
+  }
+  function velocityFromSamples(samples, windowMs = VELOCITY_WINDOW_MS) {
+    if (samples.length < 2) return { x: 0, y: 0 };
+    const last = samples[samples.length - 1];
+    let first = last;
+    for (let i = samples.length - 1; i >= 0; i--) {
+      if (last.t - samples[i].t > windowMs) break;
+      first = samples[i];
+    }
+    const dt = last.t - first.t;
+    if (dt <= 0) return { x: 0, y: 0 };
+    return { x: (last.x - first.x) / dt * 1e3, y: (last.y - first.y) / dt * 1e3 };
+  }
+  function mountDrag(stage, hooks) {
+    let active = null;
+    let dragging = false;
+    let activePointerId = -1;
+    let grabDx = 0;
+    let grabDy = 0;
+    let samples = [];
+    const pushSample = (e) => {
+      const w = hooks.toWorld(e.clientX, e.clientY);
+      const s = { x: w.x, y: w.y, t: performance.now() };
+      samples.push(s);
+      if (samples.length > MAX_SAMPLES) samples.shift();
+      return s;
+    };
+    const onPointerDown = (e) => {
+      if (active) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      const hit = hooks.hitTest(e.target);
+      if (!hit) return;
+      if (hit.fixed) return;
+      active = hit;
+      dragging = false;
+      activePointerId = e.pointerId;
+      samples = [];
+      const w = pushSample(e);
+      grabDx = hit.x - w.x;
+      grabDy = hit.y - w.y;
+    };
+    const onPointerMove = (e) => {
+      if (!active || e.pointerId !== activePointerId) return;
+      const w = pushSample(e);
+      if (!dragging) {
+        const first = samples[0];
+        if (Math.hypot(w.x - first.x, w.y - first.y) <= DRAG_THRESHOLD_PX) return;
+        dragging = true;
+        active.dragging = true;
+        hooks.onDragStart(active);
+      }
+      active.x = w.x + grabDx;
+      active.y = w.y + grabDy;
+      hooks.onDragMove(active);
+    };
+    const finish = (e, cancelled) => {
+      if (!active || e.pointerId !== activePointerId) return;
+      const target = active;
+      const wasDragging = dragging;
+      active = null;
+      dragging = false;
+      activePointerId = -1;
+      if (wasDragging) {
+        target.dragging = false;
+        const velocity = cancelled ? { x: 0, y: 0 } : velocityFromSamples(samples);
+        hooks.onDrop(target, velocity);
+        return;
+      }
+      if (!cancelled && classifyGesture(samples) === "tap") hooks.onTap(target);
+    };
+    const onPointerUp = (e) => finish(e, false);
+    const onPointerCancel = (e) => finish(e, true);
+    stage.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerCancel);
+    return {
+      get isDragging() {
+        return dragging;
+      },
+      destroy: () => {
+        stage.removeEventListener("pointerdown", onPointerDown);
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerCancel);
+      }
+    };
+  }
+
   // src/rng.ts
   function mulberry32(seed) {
     let a = seed >>> 0;
@@ -50,6 +151,9 @@
   }
 
   // src/physics/force.ts
+  function isImmovable(body) {
+    return body.fixed || body.pinned || body.dragging;
+  }
   var DEFAULT_PARAMS = {
     repulsion: 52e4,
     centering: 0.9,
@@ -59,7 +163,8 @@
     dt: 1 / 60,
     alphaDecay: 0.0225,
     alphaMin: 2e-3,
-    collisionRelax: 0.62
+    collisionRelax: 0.8,
+    collisionSpacing: 1.22
   };
   function cellKey(cx, cy) {
     return `${cx},${cy}`;
@@ -155,7 +260,7 @@
       const p = this.params;
       const alpha = this.alphaValue;
       for (const body of bodies) {
-        if (body.fixed || body.pinned) {
+        if (isImmovable(body)) {
           body.vx = 0;
           body.vy = 0;
           continue;
@@ -192,7 +297,7 @@
         body.vy = vy;
       }
       for (const body of bodies) {
-        if (body.fixed || body.pinned) continue;
+        if (isImmovable(body)) continue;
         body.x += body.vx * p.dt;
         body.y += body.vy * p.dt;
       }
@@ -201,16 +306,17 @@
       this.rebuildGrid(spaceId);
       this.decayAlpha();
     }
-    /** 椭圆碰撞。fixed/pinned 的泡泡不动，只推开对方。 */
+    /** 椭圆碰撞。不可推动的泡泡不动，只推开对方。 */
     resolveCollisions(bodies) {
       const relax = this.params.collisionRelax;
+      const spacing = this.params.collisionSpacing;
       for (const body of bodies) {
         for (const other of this.neighborsOf(body)) {
           if (body.id >= other.id) continue;
           const dx = other.x - body.x;
           const dy = other.y - body.y;
-          const sumRx = body.rx + other.rx;
-          const sumRy = body.ry + other.ry;
+          const sumRx = (body.rx + other.rx) * spacing;
+          const sumRy = (body.ry + other.ry) * spacing;
           if (sumRx <= 0 || sumRy <= 0) continue;
           const nx = dx / sumRx;
           const ny = dy / sumRy;
@@ -230,8 +336,8 @@
           const overlap = (1 - dist) * Math.min(sumRx, sumRy) * relax;
           const pushX = ux * overlap * 0.5;
           const pushY = uy * overlap * 0.5;
-          const bodyMovable = !body.fixed && !body.pinned;
-          const otherMovable = !other.fixed && !other.pinned;
+          const bodyMovable = !isImmovable(body);
+          const otherMovable = !isImmovable(other);
           if (bodyMovable && otherMovable) {
             body.x -= pushX;
             body.y -= pushY;
@@ -570,6 +676,9 @@
   function writePosition(view) {
     const { x, y } = view.body;
     view.el.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+  }
+  function setPinned(view, pinned) {
+    view.el.classList.toggle("bubble--pinned", pinned);
   }
   function updateHeartLabel(view, name) {
     const label = view.inner.querySelector(".bubble-label");
@@ -1327,6 +1436,9 @@
   function identityViewport() {
     return { scale: 1, tx: 0, ty: 0 };
   }
+  function screenToWorld(vp, p) {
+    return { x: (p.x - vp.tx) / vp.scale, y: (p.y - vp.ty) / vp.scale };
+  }
   function worldTransform(vp) {
     return `translate3d(${vp.tx}px, ${vp.ty}px, 0) scale(${vp.scale})`;
   }
@@ -1413,6 +1525,14 @@
     rafId = 0;
     frameIndex = 0;
     viewportSaveTimer = 0;
+    drag = null;
+    /**
+     * 拖拽过、但还没把最终坐标写回数据库的 idea。
+     * 值是该位置的"被放下时刻"（写进 movedAt，不是写入时刻 —— 两者差几百毫秒，
+     * 但 movedAt 是给同步合并做 LWW 比较用的，越接近真实变化时刻越准）。
+     */
+    pendingPosition = /* @__PURE__ */ new Map();
+    positionSaveTimer = 0;
     constructor() {
       this.stage = must("#stage");
       this.world = must("#world");
@@ -1433,6 +1553,119 @@
         onEmpty: () => void this.emptyTrash()
       });
       this.bindViewportGestures();
+      this.mountDragController();
+      this.bindLifecycleFlush();
+    }
+    // ── 拖拽 ──────────────────────────────────────────────
+    mountDragController() {
+      this.drag = mountDrag(this.stage, {
+        hitTest: (target) => {
+          const el = target instanceof Element ? target.closest(".bubble") : null;
+          const id = el?.dataset.id;
+          if (!id) return null;
+          if (id === HEART_ID) return this.heartBody;
+          return this.views.get(id)?.body ?? null;
+        },
+        toWorld: (clientX, clientY) => {
+          const rect = this.stage.getBoundingClientRect();
+          return screenToWorld(this.viewport, { x: clientX - rect.left, y: clientY - rect.top });
+        },
+        onDragStart: (body) => {
+          body.vx = 0;
+          body.vy = 0;
+          this.field.wake(0.35);
+          this.startLoop();
+        },
+        onDragMove: () => {
+          this.field.wake(0.35);
+          this.startLoop();
+        },
+        onDrop: (body, velocity) => {
+          body.vx = velocity.x;
+          body.vy = velocity.y;
+          this.field.wake(0.5);
+          this.startLoop();
+          this.schedulePositionSave(body.id, Date.now());
+        },
+        onTap: () => {
+        }
+      });
+    }
+    /** 记下"这个泡泡被拖过"，等星云停稳再落库。 */
+    schedulePositionSave(ideaId, movedAt) {
+      this.pendingPosition.set(ideaId, movedAt);
+      this.armPositionFlush();
+    }
+    armPositionFlush() {
+      window.clearTimeout(this.positionSaveTimer);
+      this.positionSaveTimer = window.setTimeout(() => void this.flushPositions(), 250);
+    }
+    /**
+     * 把待保存的位置写回 IndexedDB。**默认只在星云停稳之后才写。**
+     *
+     * 🔴 为什么不能松手就写：松手后泡泡还会滑一段（这是刻意的"飘一点"）。
+     *    如果那时就落库，下次打开它会停在半路，而不是你看着它停下的地方。
+     *    实测踩过：500ms 防抖写下的坐标比最终静止位置差 9 个单位。
+     *
+     * 还没停稳就不写，重新排一次检查；实在等不到（用户一直在操作），
+     * 由 pagehide / 切空间 / 关浮层时以 force = true 强制写。
+     */
+    async flushPositions(force = false) {
+      if (this.pendingPosition.size === 0) return;
+      window.clearTimeout(this.positionSaveTimer);
+      if (!force && this.field.tier() !== "asleep") {
+        this.armPositionFlush();
+        return;
+      }
+      const pending = [...this.pendingPosition.entries()];
+      this.pendingPosition.clear();
+      for (const [ideaId, movedAt] of pending) {
+        const body = this.views.get(ideaId)?.body;
+        if (!body) continue;
+        const idea = await this.store.getIdea(ideaId);
+        if (!idea) continue;
+        await this.store.putIdea({
+          ...idea,
+          x: body.x,
+          y: body.y,
+          // 🔴 只动位置就只更新 movedAt。updatedAt 留给文本/归档 ——
+          //    两者分离是阶段 6 同步合并的前提：否则拖一下泡泡
+          //    会用本地时间戳把另一台设备上刚改的文本压掉。
+          movedAt
+        });
+      }
+    }
+    async savePinned(ideaId, pinned) {
+      const idea = await this.store.getIdea(ideaId);
+      if (!idea) return;
+      await this.store.putIdea({
+        ...idea,
+        pinned: pinned ? 1 : 0,
+        // 锁定是"设置"而不是"移动"，所以走 updatedAt
+        updatedAt: Date.now()
+      });
+    }
+    /** 双击泡泡：切换锁定。锁定的泡泡力场完全绕过它。 */
+    togglePin(view) {
+      const body = view.body;
+      if (body.fixed) return;
+      body.pinned = !body.pinned;
+      setPinned(view, body.pinned);
+      this.field.wake(0.35);
+      this.startLoop();
+      void this.savePinned(body.id, body.pinned);
+      this.notice(body.pinned ? "\u5DF2\u9501\u5B9A\u8FD9\u4E2A\u4F4D\u7F6E" : "\u5DF2\u89E3\u9501\uFF0C\u5B83\u4F1A\u8DDF\u7740\u661F\u4E91\u6D41\u52A8", "info");
+    }
+    /** 页面被藏起来 / 要关掉之前，把没落库的位置补上。 */
+    bindLifecycleFlush() {
+      const flush = () => {
+        void this.flushPositions(true);
+        void this.saveViewportNow();
+      };
+      window.addEventListener("pagehide", flush);
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") flush();
+      });
     }
     // ── 启动 ──────────────────────────────────────────────
     async start() {
@@ -1504,7 +1737,8 @@
         rx: 0,
         ry: 0,
         fixed: true,
-        pinned: true
+        pinned: true,
+        dragging: false
       };
       this.heartBody = heartBody;
       this.heartView = createHeartBubble(heartBody, space.name, {
@@ -1518,7 +1752,9 @@
       for (const idea of ideas) {
         const body = this.bodyFromIdea(idea);
         bodies.push(body);
-        const view = createIdeaBubble(body, idea.text);
+        const view = createIdeaBubble(body, idea.text, {
+          onDblClick: (v) => this.togglePin(v)
+        });
         this.views.set(idea.id, view);
         this.world.appendChild(view.el);
       }
@@ -1555,7 +1791,8 @@
         rx: 0,
         ry: 0,
         fixed: false,
-        pinned: idea.pinned === 1
+        pinned: idea.pinned === 1,
+        dragging: false
       };
     }
     // ── 动画循环（三档降频）────────────────────────────────
@@ -1576,6 +1813,7 @@
       const tier = this.field.tier();
       if (tier === "asleep") {
         this.rafId = 0;
+        if (this.pendingPosition.size > 0) void this.flushPositions();
         return;
       }
       if (tier === "full" || this.frameIndex % 4 === 0) {
@@ -1705,6 +1943,7 @@
     }
     // ── 空间操作 ──────────────────────────────────────────
     openSpaceLayer(focusRename) {
+      this.trashLayer.close();
       this.spaceLayer.show(this.spaces, this.current?.id ?? "", focusRename);
     }
     async switchSpace(spaceId) {
@@ -1714,6 +1953,7 @@
         this.spaceLayer.close();
         return;
       }
+      await this.flushPositions(true);
       await this.saveViewportNow();
       this.spaceLayer.close();
       await this.openSpace(space);
@@ -1819,7 +2059,9 @@
       const bodies = this.field.bodiesOf(space.id);
       await this.store.putIdea(idea);
       const body = this.bodyFromIdea(idea);
-      const view = createIdeaBubble(body, idea.text);
+      const view = createIdeaBubble(body, idea.text, {
+        onDblClick: (v) => this.togglePin(v)
+      });
       this.views.set(idea.id, view);
       this.world.appendChild(view.el);
       bodies.push(body);
@@ -1852,6 +2094,23 @@
         emptyTrash: () => this.emptyTrash(),
         listIdeas: () => this.store.getAllIdeas(),
         positions: (spaceId) => this.field.bodiesOf(spaceId).map((b) => ({ id: b.id, x: b.x, y: b.y })),
+        /** 某个想法泡泡的运行时状态（拖拽 / 锁定的验证用）。 */
+        bodyState: (ideaId) => {
+          const b = this.views.get(ideaId)?.body;
+          return b ? { x: b.x, y: b.y, vx: b.vx, vy: b.vy, pinned: b.pinned, dragging: b.dragging } : null;
+        },
+        /** 心泡泡的状态（验证"心泡泡永远拖不动"）。 */
+        heartState: () => {
+          const b = this.heartBody;
+          return b ? { x: b.x, y: b.y, fixed: b.fixed, dragging: b.dragging } : null;
+        },
+        /** 数据库里的那条记录（验证位置持久化与 pinned 落库）。 */
+        storedIdea: (ideaId) => this.store.getIdea(ideaId),
+        isDragging: () => this.drag?.isDragging ?? false,
+        /** 回全貌（双击空白走的就是这个）。 */
+        fitAll: () => this.fitAll(),
+        /** 把待写回的位置立刻落库（测试与关页面前用）。 */
+        flushPositions: () => this.flushPositions(true),
         /**
          * 空间隔离自检：逐个空间重建网格，统计"邻居里有多少属于别的空间"。
          * 正确实现下这个数必须是 0 —— 因为网格按空间分区，查到别的空间在结构上不可能。

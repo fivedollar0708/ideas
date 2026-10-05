@@ -150,6 +150,86 @@ async function typeAndEnter(cdp, text) {
   await sleep(240);
 }
 
+/** 取某个元素的中心（视口坐标）。 */
+async function centerOf(cdp, selector) {
+  return evaluate(
+    cdp,
+    `(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    })()`,
+  );
+}
+
+/**
+ * 用真实鼠标事件拖拽。
+ * Chrome 会把这些鼠标事件同时合成为 pointer 事件，所以走的就是应用真实的拖拽链路。
+ */
+async function mouseDrag(cdp, selector, dx, dy, steps = 10) {
+  const from = await centerOf(cdp, selector);
+  if (!from) throw new Error(`找不到元素：${selector}`);
+
+  await cdp.send('Input.dispatchMouseEvent', {
+    type: 'mousePressed',
+    x: from.x,
+    y: from.y,
+    button: 'left',
+    buttons: 1,
+    clickCount: 1,
+  });
+
+  for (let i = 1; i <= steps; i++) {
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: from.x + (dx * i) / steps,
+      y: from.y + (dy * i) / steps,
+      button: 'left',
+      buttons: 1,
+    });
+    await sleep(16);
+  }
+
+  await cdp.send('Input.dispatchMouseEvent', {
+    type: 'mouseReleased',
+    x: from.x + dx,
+    y: from.y + dy,
+    button: 'left',
+    buttons: 0,
+    clickCount: 1,
+  });
+
+  return { from, to: { x: from.x + dx, y: from.y + dy } };
+}
+
+/** 双击（第二下要带 clickCount: 2，Chrome 才会派发 dblclick）。 */
+async function doubleClick(cdp, selector) {
+  const p = await centerOf(cdp, selector);
+  if (!p) throw new Error(`找不到元素：${selector}`);
+
+  for (const clickCount of [1, 2]) {
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: p.x,
+      y: p.y,
+      button: 'left',
+      buttons: 1,
+      clickCount,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: p.x,
+      y: p.y,
+      button: 'left',
+      buttons: 0,
+      clickCount,
+    });
+    await sleep(40);
+  }
+  await sleep(200);
+}
+
 // ── 断言 ──────────────────────────────────────────────
 
 let passed = 0;
@@ -197,6 +277,18 @@ async function main() {
     cdp = await connect(page.webSocketDebuggerUrl);
     await cdp.send('Runtime.enable');
     await cdp.send('Page.enable');
+
+    // 🔴 固定视口尺寸。headless 的默认窗口只有 754×333，而泡泡的散布半径可达 320 ——
+    //    在小窗口里很多泡泡会落在 #stage 之外被裁掉，于是"真实鼠标点击"点不到它们，
+    //    拖拽测试会以"什么都不发生"的形式假失败。固定成常见笔记本尺寸再加载。
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 1024,
+      height: 800,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await cdp.send('Page.navigate', { url: URL_BASE });
+    await sleep(600);
 
     // 🔴 删除空间 / 清空回收站都用了 window.confirm。headless 下原生对话框
     //    会一直等在那里，不处理的话脚本会直接挂死。这里全部自动"确定"。
@@ -367,6 +459,246 @@ async function main() {
       await evaluate(cdp, `document.querySelector('#space-layer').hidden`),
       '点某个空间后浮层收回',
     );
+
+    console.log('\n── 拖拽（阶段 3） ──');
+
+    // 回到 A 空间并等星云先静止 —— 否则"拖动前后"的对比会被星云自身的流动污染
+    await evaluate(cdp, `window.__nebula.switchSpace(${JSON.stringify(spaceA)})`);
+    await sleep(800);
+    // 先把全部泡泡收进视野，保证后面用真实鼠标点得到它们
+    await evaluate(cdp, `window.__nebula.fitAll()`);
+    await sleep(300);
+    await waitUntil(cdp, `window.__nebula.field.tier() === 'asleep'`, 20000);
+
+    const targetId = await evaluate(
+      cdp,
+      `(() => {
+        const stage = document.querySelector('#stage').getBoundingClientRect();
+        const inside = Array.from(document.querySelectorAll('.bubble--idea')).find((el) => {
+          const r = el.getBoundingClientRect();
+          return r.left >= stage.left + 4 && r.top >= stage.top + 4 &&
+                 r.right <= stage.right - 4 && r.bottom <= stage.bottom - 4;
+        });
+        return inside ? inside.dataset.id : null;
+      })()`,
+    );
+    ok(typeof targetId === 'string' && targetId.length > 0, '找到一个完整落在画布内的可拖泡泡', String(targetId));
+
+    const bubbleSel = `.bubble[data-id="${targetId}"]`;
+    const p0 = JSON.parse(await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`));
+
+    // 分步拖：按下 → 移动到位 → **先不松手**
+    const from = await centerOf(cdp, bubbleSel);
+    const DX = 260;
+    const DY = 120;
+    const STEPS = 12;
+
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: from.x,
+      y: from.y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    for (let i = 1; i <= STEPS; i++) {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: from.x + (DX * i) / STEPS,
+        y: from.y + (DY * i) / STEPS,
+        button: 'left',
+        buttons: 1,
+      });
+      await sleep(16);
+    }
+
+    ok(await evaluate(cdp, `window.__nebula.isDragging()`), '越过 8px 阈值后进入了拖拽状态');
+
+    // 🔴 按住不动 250ms：坐标必须一动不动。
+    //    如果引擎还在写它，这里会看到抖动或被"吸回"。
+    const holdA = await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`);
+    await sleep(250);
+    const holdB = await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`);
+    ok(holdA === holdB, '按住不动 250ms，泡泡坐标完全没变（引擎确实没在写它）', `${holdA} → ${holdB}`);
+
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: from.x + DX,
+      y: from.y + DY,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+
+    // 松手瞬间取样（只等一帧），用来量"飘了多远"
+    await sleep(30);
+    const atRelease = JSON.parse(
+      await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`),
+    );
+    const speed = Math.hypot(atRelease.vx, atRelease.vy);
+    ok(speed > 50, `松手时挂上了甩出速度（${speed.toFixed(0)} 单位/秒）`);
+    ok(atRelease.dragging === false, '松手后 dragging 标记立刻清掉');
+
+    // 等它滑完并落库
+    await waitUntil(cdp, `window.__nebula.field.tier() === 'asleep'`, 20000);
+    await sleep(700);
+
+    const settled = JSON.parse(
+      await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`),
+    );
+
+    // 🔴 这一条直接验证用户的原话："默认不立刻定住，松手后会飘一点"
+    const glide = Math.hypot(settled.x - atRelease.x, settled.y - atRelease.y);
+    ok(glide > 5, `松手后不是硬停，又飘了 ${glide.toFixed(0)} 个单位才停下`);
+
+    const movedBy = Math.hypot(settled.x - p0.x, settled.y - p0.y);
+    ok(movedBy > 150, `整个手势把它挪走了 ${movedBy.toFixed(0)} 个单位`);
+
+    console.log('\n── 位置持久化（阶段 3） ──');
+
+    const stored = JSON.parse(
+      await evaluate(
+        cdp,
+        `window.__nebula.storedIdea(${JSON.stringify(targetId)}).then(i =>
+          JSON.stringify({ x: i.x, y: i.y, movedAt: i.movedAt, updatedAt: i.updatedAt, createdAt: i.createdAt }))`,
+      ),
+    );
+
+    ok(
+      Math.hypot(stored.x - settled.x, stored.y - settled.y) < 2,
+      '数据库里的坐标 = 泡泡最终停下的位置',
+      `库 (${stored.x.toFixed(0)}, ${stored.y.toFixed(0)}) vs 屏 (${settled.x.toFixed(0)}, ${settled.y.toFixed(0)})`,
+    );
+    ok(stored.movedAt > 0, 'movedAt 已写入');
+    ok(
+      stored.updatedAt === stored.createdAt,
+      '🔴 拖拽只动了 movedAt，updatedAt 与 createdAt 仍相等（两个时间戳确实分离）',
+      `updatedAt=${stored.updatedAt} createdAt=${stored.createdAt}`,
+    );
+
+    // 刷新后应该回到落库的位置，而不是原来的随机落点
+    await cdp.send('Page.reload', { ignoreCache: true });
+    await sleep(400);
+    await waitUntil(cdp, `document.readyState === 'complete' && !!window.__nebula`);
+    await waitUntil(cdp, `!!window.__nebula.bodyState(${JSON.stringify(targetId)})`, 10000);
+
+    const afterReload = JSON.parse(
+      await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`),
+    );
+    const dStored = Math.hypot(afterReload.x - stored.x, afterReload.y - stored.y);
+    const dOriginal = Math.hypot(afterReload.x - p0.x, afterReload.y - p0.y);
+    ok(
+      dStored < dOriginal,
+      '刷新后泡泡回到数据库里记的位置，而不是原来的随机落点',
+      `到落库位置 ${dStored.toFixed(0)}，到原始位置 ${dOriginal.toFixed(0)}`,
+    );
+
+    console.log('\n── 双击锁定（阶段 3） ──');
+
+    await doubleClick(cdp, bubbleSel);
+    ok(
+      (await evaluate(cdp, `window.__nebula.storedIdea(${JSON.stringify(targetId)}).then(i => i.pinned)`)) === 1,
+      '双击后 pinned 落库为 1',
+    );
+    ok(
+      await evaluate(
+        cdp,
+        `document.querySelector('.bubble[data-id="${targetId}"]').classList.contains('bubble--pinned')`,
+      ),
+      '泡泡加上了「已锁定」外观',
+    );
+
+    // 锁定的泡泡在星云里应该纹丝不动
+    const pinBefore = JSON.parse(
+      await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`),
+    );
+    await evaluate(cdp, `window.__nebula.field.wake(1)`);
+    await sleep(1500);
+    const pinAfter = JSON.parse(
+      await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`),
+    );
+    ok(
+      pinBefore.x === pinAfter.x && pinBefore.y === pinAfter.y,
+      '锁定后唤醒星云跑 1.5 秒，它的坐标一动不动',
+      `${pinBefore.x.toFixed(0)},${pinBefore.y.toFixed(0)} → ${pinAfter.x.toFixed(0)},${pinAfter.y.toFixed(0)}`,
+    );
+
+    await doubleClick(cdp, bubbleSel);
+    ok(
+      (await evaluate(cdp, `window.__nebula.storedIdea(${JSON.stringify(targetId)}).then(i => i.pinned)`)) === 0,
+      '再双击一次解除锁定',
+    );
+
+    console.log('\n── 心泡泡不可拖（阶段 3） ──');
+
+    const heartBefore = JSON.parse(await evaluate(cdp, `JSON.stringify(window.__nebula.heartState())`));
+    await mouseDrag(cdp, '.bubble--heart', 180, 90);
+    await sleep(400);
+    const heartAfter = JSON.parse(await evaluate(cdp, `JSON.stringify(window.__nebula.heartState())`));
+    ok(
+      heartAfter.x === heartBefore.x && heartAfter.y === heartBefore.y,
+      '心泡泡被拖了也不动（它钉在世界原点）',
+      JSON.stringify(heartAfter),
+    );
+    ok(heartAfter.dragging === false, '心泡泡从未进入拖拽状态');
+    ok(
+      await evaluate(cdp, `document.querySelector('#space-layer').hidden`),
+      '拖心泡泡没有误触发空间切换浮层',
+    );
+
+    console.log('\n── 命中测试（真实点击路径） ──');
+
+    // 先回全貌，保证待测的泡泡确实在画布内
+    await evaluate(cdp, `window.__nebula.fitAll()`);
+    await sleep(250);
+
+    // 🔴 这一节存在的理由：JS 的 element.click() 会**绕过命中测试**直接派发事件，
+    //    所以"用 .click() 测通过"完全不能说明用户点得到。曾经有个 bug 是浮层
+    //    以 transparent + 可命中的状态一直盖在页面上，把全部鼠标点击吃掉了，
+    //    而当时所有测试都用 .click()，一条都没发现。
+    const hitProbe = await evaluate(
+      cdp,
+      `(() => {
+        const el = document.querySelector('.bubble--idea');
+        if (!el) return { ok: false, why: '没有想法泡泡' };
+        const r = el.getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return {
+          ok: !!(hit && hit.closest('.bubble')),
+          hit: hit ? hit.tagName + '.' + hit.className : 'null',
+          x: Math.round(r.left + r.width / 2),
+          y: Math.round(r.top + r.height / 2),
+        };
+      })()`,
+    );
+
+    // 前提：此时不能有任何浮层开着，否则测的是浮层而不是泡泡
+    ok(
+      await evaluate(
+        cdp,
+        `Array.from(document.querySelectorAll('.layer')).every(l => l.hidden === true)`,
+      ),
+      '命中测试前没有任何浮层开着（前提成立）',
+    );
+
+    ok(hitProbe.ok, '泡泡中心点上的元素就是这个泡泡（没有被透明浮层盖住）', JSON.stringify(hitProbe));
+
+    const hiddenLayers = await evaluate(
+      cdp,
+      `Array.from(document.querySelectorAll('.layer')).every(l => l.hidden === true ? getComputedStyle(l).display === 'none' : true)`,
+    );
+    ok(hiddenLayers, '带 hidden 的浮层真的不参与布局与命中测试（display: none）');
+
+    const heartHit = await evaluate(
+      cdp,
+      `(() => {
+        const el = document.querySelector('.bubble--heart');
+        const r = el.getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return !!(hit && hit.closest('.bubble--heart'));
+      })()`,
+    );
+    ok(heartHit, '心泡泡中心点上的元素就是心泡泡本身');
 
     console.log('\n── 页面内自检 ──');
 

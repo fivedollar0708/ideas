@@ -153,6 +153,18 @@ body {
   color: var(--text);
 }
 
+/*
+ * 已锁定：位置是你定的，星云不再推动它。
+ *
+ * 需求原话是"边框从虚线变实线"，这里改成"未锁定用细描边、锁定用加重的实色描边"。
+ * 原因：把未锁定的泡泡全部画成虚线，50 个泡泡时整屏都是断线，非常吵，
+ * 而"加重"和"轻描"的对比同样一眼可辨，且默认状态是安静的。
+ * 想改成字面意义的虚线，把上面 .bubble--idea 的 border-style 改成 dashed 即可。
+ */
+.bubble--pinned .bubble-inner {
+  border: 2px solid var(--accent);
+}
+
 /* 心泡泡：正圆、实色描边、空间主色 */
 .bubble--heart .bubble-inner {
   background: var(--accent-soft);
@@ -192,6 +204,22 @@ body {
   align-items: center;
   justify-content: center;
   padding: 24px;
+}
+
+/*
+ * 🔴 这一条不能省。
+ *
+ * `.layer { display: flex }` 是**作者样式**，优先级高于浏览器默认的
+ * `[hidden] { display: none }`（UA 样式）。所以只给元素加 hidden 属性
+ * 根本藏不住它 —— 图层会以「遮罩透明 — 但仍参与命中测试」的状态继续盖在页面上，
+ * **吃掉所有鼠标点击**：点泡泡没反应、拖画布没反应、双击没反应。
+ *
+ * 症状特别有迷惑性：界面看起来完全正常（因为遮罩 opacity: 0），
+ * 而且用 JS 的 element.click() 测试照样通过（它绕过命中测试直接派发事件）。
+ * 只有真实鼠标/触屏事件才能暴露它。见 scripts/smoke.mjs 里的命中测试断言。
+ */
+.layer[hidden] {
+  display: none;
 }
 
 .layer-backdrop {

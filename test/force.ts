@@ -20,7 +20,20 @@ function body(
   ry = 20,
   extra: Partial<Body> = {},
 ): Body {
-  return { id, spaceId, x, y, vx: 0, vy: 0, rx, ry, fixed: false, pinned: false, ...extra };
+  return {
+    id,
+    spaceId,
+    x,
+    y,
+    vx: 0,
+    vy: 0,
+    rx,
+    ry,
+    fixed: false,
+    pinned: false,
+    dragging: false,
+    ...extra,
+  };
 }
 
 function snapshot(bodies: readonly Body[]): Array<{ x: number; y: number }> {
@@ -239,6 +252,53 @@ export function runForceTests(): void {
     const avgNeighbors =
       bodies.reduce((sum, b) => sum + field.neighborsOf(b).length, 0) / bodies.length;
     ok(avgNeighbors < bodies.length / 2, `平均邻居数 ${avgNeighbors.toFixed(1)} 远小于总数 ${bodies.length}`);
+  }
+
+  section('force · 拖拽中的泡泡（阶段 3）');
+
+  {
+    // 被拖拽时：引擎绝不能写它的坐标，否则"压着拖动会一边拖一边抖"
+    const field = new ForceField();
+    const dragged = body('d', 'S', 0, 0, 20, 20, { dragging: true });
+    const neighbour = body('n', 'S', 10, 0, 20, 20);
+    field.setSpaceBodies('S', [dragged, neighbour]);
+    field.setActiveSpace('S');
+    field.wake(1);
+
+    const before = { x: dragged.x, y: dragged.y };
+    for (let i = 0; i < 60; i++) field.step();
+
+    eqJson({ x: dragged.x, y: dragged.y }, before, '拖拽中的泡泡坐标完全没变（引擎不写它）');
+    ok(dragged.vx === 0 && dragged.vy === 0, '拖拽中速度恒为 0');
+    ok(
+      Math.hypot(neighbour.x - dragged.x, neighbour.y - dragged.y) > 20,
+      '邻居被拖拽中的泡泡推开了（它仍是碰撞体）',
+    );
+  }
+
+  {
+    // 松手之后：挂上甩出速度，它应该真的继续滑一段，然后被阻尼吃掉
+    const field = new ForceField();
+    const b = body('x', 'S', 0, 0, 20, 20, { dragging: true });
+    const other = body('y', 'S', 15, 0, 20, 20);
+    field.setSpaceBodies('S', [b, other]);
+    field.setActiveSpace('S');
+    field.wake(1);
+
+    for (let i = 0; i < 30; i++) field.step();
+    const frozenX = b.x;
+
+    // 模拟 onDrop：清掉 dragging（由 drag.ts 负责）并给出甩出速度
+    b.dragging = false;
+    b.vx = 300;
+    b.vy = 0;
+    field.wake(0.5);
+    for (let i = 0; i < 20; i++) field.step();
+
+    ok(b.x - frozenX > 10, `松手后按甩出速度继续滑动（Δx=${(b.x - frozenX).toFixed(1)}）`);
+
+    for (let i = 0; i < 200; i++) field.step();
+    ok(Math.abs(b.vx) < 5, `甩出速度最终被阻尼吃掉（vx=${b.vx.toFixed(2)}）`);
   }
 
   section('force · 空空间与边界');

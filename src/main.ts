@@ -12,11 +12,13 @@
  * 拖拽、锁定、飞入动画、搜索分别属于阶段 3/4/5，这里刻意不做。
  */
 
+import { mountDrag, type DragHandle } from './interact/drag';
 import { ForceField, type Body } from './physics/force';
 import {
   applyAccent,
   createHeartBubble,
   createIdeaBubble,
+  setPinned,
   updateHeartLabel,
   writePosition,
   type BubbleView,
@@ -27,7 +29,13 @@ import { installFontStackVar } from './text';
 import { mountInput, type NoticeKind } from './ui/input';
 import { SpaceLayer } from './ui/spaceLayer';
 import { TrashLayer } from './ui/trash';
-import { fitToContent, identityViewport, worldTransform, zoomAt } from './view';
+import {
+  fitToContent,
+  identityViewport,
+  screenToWorld,
+  worldTransform,
+  zoomAt,
+} from './view';
 import {
   HEART_ORIGIN,
   SPAWN_MAX_RADIUS,
@@ -101,6 +109,16 @@ class App {
   private frameIndex = 0;
   private viewportSaveTimer = 0;
 
+  private drag: DragHandle | null = null;
+
+  /**
+   * 拖拽过、但还没把最终坐标写回数据库的 idea。
+   * 值是该位置的"被放下时刻"（写进 movedAt，不是写入时刻 —— 两者差几百毫秒，
+   * 但 movedAt 是给同步合并做 LWW 比较用的，越接近真实变化时刻越准）。
+   */
+  private readonly pendingPosition = new Map<string, number>();
+  private positionSaveTimer = 0;
+
   constructor() {
     this.stage = must<HTMLElement>('#stage');
     this.world = must<HTMLElement>('#world');
@@ -124,6 +142,145 @@ class App {
     });
 
     this.bindViewportGestures();
+    this.mountDragController();
+    this.bindLifecycleFlush();
+  }
+
+  // ── 拖拽 ──────────────────────────────────────────────
+
+  private mountDragController(): void {
+    this.drag = mountDrag(this.stage, {
+      hitTest: (target) => {
+        const el = target instanceof Element ? (target.closest('.bubble') as HTMLElement | null) : null;
+        const id = el?.dataset.id;
+        if (!id) return null;
+        if (id === HEART_ID) return this.heartBody;
+        return this.views.get(id)?.body ?? null;
+      },
+
+      toWorld: (clientX, clientY) => {
+        const rect = this.stage.getBoundingClientRect();
+        return screenToWorld(this.viewport, { x: clientX - rect.left, y: clientY - rect.top });
+      },
+
+      onDragStart: (body) => {
+        // 速度清零：不然上一次的甩出速度会叠在这一次的手势上
+        body.vx = 0;
+        body.vy = 0;
+        this.field.wake(0.35);
+        this.startLoop();
+      },
+
+      onDragMove: () => {
+        // 持续唤醒：让被"犁开"的邻居及时让位，观感上像拖着一颗球划过水面
+        this.field.wake(0.35);
+        this.startLoop();
+      },
+
+      onDrop: (body, velocity) => {
+        // 🔴 把松手那一刻的手速交给引擎 —— 它不会硬停，会"飘一点"再被力场拉住
+        body.vx = velocity.x;
+        body.vy = velocity.y;
+        this.field.wake(0.5);
+        this.startLoop();
+        this.schedulePositionSave(body.id, Date.now());
+      },
+
+      onTap: () => {
+        // 阶段 4 在这里接"点击放大到屏幕中央"。
+        // 现在点击泡泡不做任何事 —— 但也不能让点击穿透去拖画布（已经在 hitTest 里拦住了）。
+      },
+    });
+  }
+
+  /** 记下"这个泡泡被拖过"，等星云停稳再落库。 */
+  private schedulePositionSave(ideaId: string, movedAt: number): void {
+    this.pendingPosition.set(ideaId, movedAt);
+    this.armPositionFlush();
+  }
+
+  private armPositionFlush(): void {
+    window.clearTimeout(this.positionSaveTimer);
+    this.positionSaveTimer = window.setTimeout(() => void this.flushPositions(), 250);
+  }
+
+  /**
+   * 把待保存的位置写回 IndexedDB。**默认只在星云停稳之后才写。**
+   *
+   * 🔴 为什么不能松手就写：松手后泡泡还会滑一段（这是刻意的"飘一点"）。
+   *    如果那时就落库，下次打开它会停在半路，而不是你看着它停下的地方。
+   *    实测踩过：500ms 防抖写下的坐标比最终静止位置差 9 个单位。
+   *
+   * 还没停稳就不写，重新排一次检查；实在等不到（用户一直在操作），
+   * 由 pagehide / 切空间 / 关浮层时以 force = true 强制写。
+   */
+  private async flushPositions(force = false): Promise<void> {
+    if (this.pendingPosition.size === 0) return;
+    window.clearTimeout(this.positionSaveTimer);
+
+    if (!force && this.field.tier() !== 'asleep') {
+      this.armPositionFlush();
+      return;
+    }
+
+    const pending = [...this.pendingPosition.entries()];
+    this.pendingPosition.clear();
+
+    for (const [ideaId, movedAt] of pending) {
+      const body = this.views.get(ideaId)?.body;
+      if (!body) continue; // 已经切了空间，这次的坐标作废（切空间前会先 flush）
+
+      const idea = await this.store.getIdea(ideaId);
+      if (!idea) continue;
+
+      await this.store.putIdea({
+        ...idea,
+        x: body.x,
+        y: body.y,
+        // 🔴 只动位置就只更新 movedAt。updatedAt 留给文本/归档 ——
+        //    两者分离是阶段 6 同步合并的前提：否则拖一下泡泡
+        //    会用本地时间戳把另一台设备上刚改的文本压掉。
+        movedAt,
+      });
+    }
+  }
+
+  private async savePinned(ideaId: string, pinned: boolean): Promise<void> {
+    const idea = await this.store.getIdea(ideaId);
+    if (!idea) return;
+    await this.store.putIdea({
+      ...idea,
+      pinned: pinned ? 1 : 0,
+      // 锁定是"设置"而不是"移动"，所以走 updatedAt
+      updatedAt: Date.now(),
+    });
+  }
+
+  /** 双击泡泡：切换锁定。锁定的泡泡力场完全绕过它。 */
+  private togglePin(view: BubbleView): void {
+    const body = view.body;
+    if (body.fixed) return; // 心泡泡本来就钉住，不需要也不能锁定
+
+    body.pinned = !body.pinned;
+    setPinned(view, body.pinned);
+
+    this.field.wake(0.35);
+    this.startLoop();
+    void this.savePinned(body.id, body.pinned);
+
+    this.notice(body.pinned ? '已锁定这个位置' : '已解锁，它会跟着星云流动', 'info');
+  }
+
+  /** 页面被藏起来 / 要关掉之前，把没落库的位置补上。 */
+  private bindLifecycleFlush(): void {
+    const flush = (): void => {
+      void this.flushPositions(true);
+      void this.saveViewportNow();
+    };
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flush();
+    });
   }
 
   // ── 启动 ──────────────────────────────────────────────
@@ -215,6 +372,7 @@ class App {
       ry: 0,
       fixed: true,
       pinned: true,
+      dragging: false,
     };
     this.heartBody = heartBody;
 
@@ -231,7 +389,9 @@ class App {
     for (const idea of ideas) {
       const body = this.bodyFromIdea(idea);
       bodies.push(body);
-      const view = createIdeaBubble(body, idea.text);
+      const view = createIdeaBubble(body, idea.text, {
+        onDblClick: (v) => this.togglePin(v),
+      });
       this.views.set(idea.id, view);
       this.world.appendChild(view.el);
     }
@@ -275,6 +435,7 @@ class App {
       ry: 0,
       fixed: false,
       pinned: idea.pinned === 1,
+      dragging: false,
     };
   }
 
@@ -300,6 +461,8 @@ class App {
 
     if (tier === 'asleep') {
       this.rafId = 0;
+      // 引擎停下来 ⇒ 泡泡停在了它最终该在的地方，这时候才把坐标写回数据库
+      if (this.pendingPosition.size > 0) void this.flushPositions();
       return;
     }
 
@@ -457,6 +620,8 @@ class App {
   // ── 空间操作 ──────────────────────────────────────────
 
   private openSpaceLayer(focusRename?: string): void {
+    // 两个浮层互斥：否则它们会叠在一起，上层的遮罩会挡住下层的所有点击
+    this.trashLayer.close();
     this.spaceLayer.show(this.spaces, this.current?.id ?? '', focusRename);
   }
 
@@ -467,6 +632,8 @@ class App {
       this.spaceLayer.close();
       return;
     }
+    // 切空间前先把拖拽的坐标落库 —— 切完之后 body 就没了，那次拖拽会白费
+    await this.flushPositions(true);
     await this.saveViewportNow();
     this.spaceLayer.close();
     await this.openSpace(space);
@@ -601,7 +768,9 @@ class App {
     await this.store.putIdea(idea);
 
     const body = this.bodyFromIdea(idea);
-    const view = createIdeaBubble(body, idea.text);
+    const view = createIdeaBubble(body, idea.text, {
+      onDblClick: (v) => this.togglePin(v),
+    });
     this.views.set(idea.id, view);
     this.world.appendChild(view.el);
 
@@ -643,6 +812,31 @@ class App {
       listIdeas: () => this.store.getAllIdeas(),
       positions: (spaceId: string) =>
         this.field.bodiesOf(spaceId).map((b) => ({ id: b.id, x: b.x, y: b.y })),
+
+      /** 某个想法泡泡的运行时状态（拖拽 / 锁定的验证用）。 */
+      bodyState: (ideaId: string) => {
+        const b = this.views.get(ideaId)?.body;
+        return b
+          ? { x: b.x, y: b.y, vx: b.vx, vy: b.vy, pinned: b.pinned, dragging: b.dragging }
+          : null;
+      },
+
+      /** 心泡泡的状态（验证"心泡泡永远拖不动"）。 */
+      heartState: () => {
+        const b = this.heartBody;
+        return b ? { x: b.x, y: b.y, fixed: b.fixed, dragging: b.dragging } : null;
+      },
+
+      /** 数据库里的那条记录（验证位置持久化与 pinned 落库）。 */
+      storedIdea: (ideaId: string) => this.store.getIdea(ideaId),
+
+      isDragging: () => this.drag?.isDragging ?? false,
+
+      /** 回全貌（双击空白走的就是这个）。 */
+      fitAll: () => this.fitAll(),
+
+      /** 把待写回的位置立刻落库（测试与关页面前用）。 */
+      flushPositions: () => this.flushPositions(true),
       /**
        * 空间隔离自检：逐个空间重建网格，统计"邻居里有多少属于别的空间"。
        * 正确实现下这个数必须是 0 —— 因为网格按空间分区，查到别的空间在结构上不可能。

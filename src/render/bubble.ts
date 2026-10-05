@@ -243,6 +243,11 @@ export function writePosition(view: BubbleView): void {
   view.el.style.transform = `translate3d(${x}px, ${y}px, 0)`;
 }
 
+/** 切换"已锁定"的外观。锁定 = 位置由你定，力场不再推动它。 */
+export function setPinned(view: BubbleView, pinned: boolean): void {
+  view.el.classList.toggle('bubble--pinned', pinned);
+}
+
 /** 更新心跳泡的文字（重命名后调用）。 */
 export function updateHeartLabel(view: BubbleView, name: string): void {
   const label = view.inner.querySelector('.bubble-label');
