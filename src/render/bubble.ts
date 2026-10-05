@@ -4,12 +4,15 @@
  * 🔴 三层元素铁律（整个项目的动画地基）：
  *
  *     .bubble        ← 位置，力导向每帧写 `translate3d(x, y, 0)`
- *       .bubble-scale← 悬停 / 选中缩放，写 `scale(...)`
- *         .bubble-inner ← 视觉与入场动画
+ *       .bubble-scale← 悬停缩放 + 落定"啵"的动画（WAAPI，不加 fill）
+ *         .bubble-inner ← 视觉（底色、描边、圆角、内外边距）
  *
- * **绝不能让两个东西抢同一个 transform 属性**。力导向每帧改外层、hover 改中层、
- * 入场动画改内层，各写各的。这个分层定下来之前不要写任何动画代码 ——
+ * **绝不能让两个东西抢同一个 transform 属性**。力导向每帧改外层、hover 与落定动画改中层、
+ * 视觉全在内层。这个分层定下来之前不要写任何动画代码 ——
  * 否则会出现"拖一下泡泡的缩放就没了"或"动画一播位置就跳"这类极难查的问题。
+ *
+ * 🔴 落定动画用 WAAPI 且 **fill 必须留空**：fill: 'both' 会让动画的最终值
+ *    一直压住 hover 的 transform，动画结束后悬停就永久失效（阶段 2 踩过）。
  *
  * 另一条：**尺寸只在创建时写一次**（width/height/margin），之后每帧只改 transform。
  * 逐帧改宽高会触发布局重算，几百个泡泡直接掉帧。
@@ -51,13 +54,26 @@ export function hueSoft(hue: number): string {
   return HUE_SOFTS[((hue % 9) + 9) % 9];
 }
 
-/** 把某个空间的主色写进 world 容器，让里面所有泡泡继承（CSS 变量天然继承）。 */
+/**
+ * 把某个空间的主色写进 world 容器，让里面所有泡泡继承（CSS 变量天然继承）。
+ *
+ * 🔴 同时写到 documentElement(:root)：飞入的**影子泡泡**和**涟漪**挂在 body 下的
+ *    固定图层里（不在 #world 内），不这样的话它们拿不到当前空间的主色，
+ *    交接瞬间会从紫色（:root 默认值）跳到该空间的颜色。
+ */
 export function applyAccent(worldEl: HTMLElement, hue: number): void {
   const accent = hueAccent(hue);
+  const soft = hueSoft(hue);
+  const line = `${accent}55`;
+
   worldEl.style.setProperty('--accent', accent);
-  worldEl.style.setProperty('--accent-soft', hueSoft(hue));
-  // 8 位 hex 的末两位是 alpha：用于"看得见但不抢眼"的描边
-  worldEl.style.setProperty('--accent-line', `${accent}55`);
+  worldEl.style.setProperty('--accent-soft', soft);
+  worldEl.style.setProperty('--accent-line', line);
+
+  const root = document.documentElement;
+  root.style.setProperty('--accent', accent);
+  root.style.setProperty('--accent-soft', soft);
+  root.style.setProperty('--accent-line', line);
 }
 
 export interface BubbleHandlers {
@@ -87,6 +103,8 @@ export interface BubbleView {
   /** 内层：视觉与入场动画。 */
   inner: HTMLDivElement;
   body: Body;
+  /** 这个泡泡上的文本。放大动画要用它重建克隆体，省得回头去 DOM 里捞。 */
+  text: string;
   destroy(): void;
 }
 
@@ -110,16 +128,14 @@ function makeShell(): { el: HTMLDivElement; scale: HTMLDivElement; inner: HTMLDi
   return { el, scale, inner };
 }
 
-/** 播一次入场动画。动画结束后把类摘掉，否则会压住 hover 的 scale。 */
-function markEntering(inner: HTMLDivElement): void {
-  inner.classList.add('is-entering');
-  inner.addEventListener(
-    'animationend',
-    () => {
-      inner.classList.remove('is-entering');
-    },
-    { once: true },
-  );
+/** 标记"这个泡泡正在被拖拽"，用来关掉 hover 效果（否则会一边拖一边胀大）。 */
+export function setDragging(view: BubbleView, dragging: boolean): void {
+  view.el.classList.toggle('bubble--dragging', dragging);
+}
+
+/** 暂时隐藏 / 显示一个泡泡（放大到中央时用）。 */
+export function setHidden(view: BubbleView, hidden: boolean): void {
+  view.el.classList.toggle('bubble--hidden', hidden);
 }
 
 function bindHandlers(view: BubbleView, handlers: BubbleHandlers): () => void {
@@ -172,9 +188,8 @@ export function createIdeaBubble(
   label.style.fontSize = `${FONT_SIZE}px`;
   inner.style.setProperty('--lines', String(fitLines(ry)));
   inner.appendChild(label);
-  markEntering(inner);
 
-  const view: BubbleView = { el, scale, inner, body, destroy: () => {} };
+  const view: BubbleView = { el, scale, inner, body, text, destroy: () => {} };
   const unbind = bindHandlers(view, handlers);
   view.destroy = () => {
     unbind();
@@ -222,9 +237,9 @@ export function createHeartBubble(
 
   inner.appendChild(label);
   inner.appendChild(hint);
-  markEntering(inner);
 
-  const view: BubbleView = { el, scale, inner, body, destroy: () => {} };
+  // 心泡泡的 text 就是空间名（放大动画理论上不会作用在它身上，但保持一致）
+  const view: BubbleView = { el, scale, inner, body, text: name, destroy: () => {} };
   const unbind = bindHandlers(view, handlers);
   view.destroy = () => {
     unbind();

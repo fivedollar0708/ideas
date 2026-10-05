@@ -18,14 +18,18 @@ import {
   applyAccent,
   createHeartBubble,
   createIdeaBubble,
+  setDragging,
+  setHidden,
   setPinned,
   updateHeartLabel,
   writePosition,
   type BubbleView,
 } from './render/bubble';
+import { flyIn, getLastFlight, playPop } from './render/flyIn';
+import { getLastZoom, openZoom, type ZoomHandle } from './render/zoom';
 import { makeRng, newId } from './rng';
 import { NebulaStore } from './store';
-import { installFontStackVar } from './text';
+import { installFontStackVar, radiusOfCached } from './text';
 import { mountInput, type NoticeKind } from './ui/input';
 import { SpaceLayer } from './ui/spaceLayer';
 import { TrashLayer } from './ui/trash';
@@ -33,6 +37,7 @@ import {
   fitToContent,
   identityViewport,
   screenToWorld,
+  worldToScreen,
   worldTransform,
   zoomAt,
 } from './view';
@@ -47,6 +52,12 @@ import {
 
 /** 心泡泡的 body id。带前缀是为了永不和 UUID 撞上。 */
 const HEART_ID = '__heart__';
+
+/**
+ * 单击与双击的判别窗口（ms）。
+ * 单击（放大）要等它、双击（锁定）要在这个窗口内把单击取消掉。见 handleTap 的注释。
+ */
+const DOUBLE_CLICK_GUARD_MS = 220;
 
 function must<T extends HTMLElement>(selector: string): T {
   const el = document.querySelector<T>(selector);
@@ -111,6 +122,9 @@ class App {
 
   private drag: DragHandle | null = null;
 
+  /** 当前打开的放大态。同一时刻只允许一个。 */
+  private zoom: ZoomHandle | null = null;
+
   /**
    * 拖拽过、但还没把最终坐标写回数据库的 idea。
    * 值是该位置的"被放下时刻"（写进 movedAt，不是写入时刻 —— 两者差几百毫秒，
@@ -118,6 +132,9 @@ class App {
    */
   private readonly pendingPosition = new Map<string, number>();
   private positionSaveTimer = 0;
+
+  /** 待处理的单击（等双击判别窗口过去才真正放大）。 */
+  private tapTimer = 0;
 
   constructor() {
     this.stage = must<HTMLElement>('#stage');
@@ -167,6 +184,9 @@ class App {
         // 速度清零：不然上一次的甩出速度会叠在这一次的手势上
         body.vx = 0;
         body.vy = 0;
+        // 🔴 关掉这个泡泡的 hover 效果，否则拖的时候它会一直胀大
+        const view = this.views.get(body.id);
+        if (view) setDragging(view, true);
         this.field.wake(0.35);
         this.startLoop();
       },
@@ -178,6 +198,8 @@ class App {
       },
 
       onDrop: (body, velocity) => {
+        const view = this.views.get(body.id);
+        if (view) setDragging(view, false);
         // 🔴 把松手那一刻的手速交给引擎 —— 它不会硬停，会"飘一点"再被力场拉住
         body.vx = velocity.x;
         body.vy = velocity.y;
@@ -186,11 +208,69 @@ class App {
         this.schedulePositionSave(body.id, Date.now());
       },
 
-      onTap: () => {
-        // 阶段 4 在这里接"点击放大到屏幕中央"。
-        // 现在点击泡泡不做任何事 —— 但也不能让点击穿透去拖画布（已经在 hitTest 里拦住了）。
+      onTap: (body, at) => {
+        const view = this.views.get(body.id);
+        if (view) this.handleTap(view, at);
       },
     });
+  }
+
+  /**
+   * 单击泡泡。
+   *
+   * 🔴 这里必须**延迟 220ms 再放大**，因为单击（放大）和双击（锁定）落在同一个元素上，
+   *    天然冲突：如果单击立刻打开放大浮层，第二次点击就会打在浮层的遮罩上，
+   *    dblclick 永远收不到 —— 表现是"双击锁定失灵"（阶段 4 实测踩到）。
+   *    延迟这段时间用来等"是不是双击"。
+   *
+   *    代价是放大有 220ms 的延迟。取舍：锁定是个低频动作，但双击一旦失灵就是彻底坏掉，
+   *    所以宁可让放大稍钝一点。
+   */
+  private handleTap(view: BubbleView, at: { x: number; y: number }): void {
+    window.clearTimeout(this.tapTimer);
+    this.tapTimer = window.setTimeout(() => {
+      this.tapTimer = 0;
+      this.zoomToCenter(view, at);
+    }, DOUBLE_CLICK_GUARD_MS);
+  }
+
+  /** 双击泡泡 → 切换锁定。同时取消那次待处理的单击。 */
+  private handleDblClick(view: BubbleView): void {
+    window.clearTimeout(this.tapTimer);
+    this.tapTimer = 0;
+    this.togglePin(view);
+  }
+
+  // ── 放大到中央（FLIP）────────────────────────────────
+
+  /**
+   * 点一个泡泡 → 放大到屏幕中央。
+   *
+   * 做法是**克隆**而不是直接动真泡泡：真泡泡住在被 translate+scale 变换过的 #world 里，
+   * 把它拖出来做 FLIP 会先经历一次坐标系跳变，而且它每帧还被力导向写 transform。
+   * 克隆到 body 下的固定图层里动画，真泡泡只暂时隐藏，收回时原地复活、位置分毫不动。
+   */
+  private zoomToCenter(view: BubbleView, pointer: { x: number; y: number }): void {
+    if (this.zoom) return; // 已经有一个开着，先让它收
+
+    const domRect = view.el.getBoundingClientRect();
+    const srcRect = { x: domRect.left, y: domRect.top, w: domRect.width, h: domRect.height };
+    setHidden(view, true);
+
+    this.zoom = openZoom({
+      text: view.text,
+      srcRect,
+      pointer,
+      onClose: () => {
+        setHidden(view, false);
+        this.zoom = null;
+      },
+    });
+  }
+
+  /** 关掉放大态（切空间、重命名等会改动布局的操作前调用）。 */
+  private closeZoom(): void {
+    this.zoom?.close();
   }
 
   /** 记下"这个泡泡被拖过"，等星云停稳再落库。 */
@@ -348,6 +428,9 @@ class App {
   // ── 打开一个空间 ──────────────────────────────────────
 
   private async openSpace(space: Space, opts: { ignoreSaved?: boolean } = {}): Promise<void> {
+    // 切空间会重建所有泡泡，放大态的克隆体会指向已销毁的源泡泡 —— 先收掉
+    this.closeZoom();
+
     this.current = space;
     await this.store.setLastSpaceId(space.id);
 
@@ -390,7 +473,7 @@ class App {
       const body = this.bodyFromIdea(idea);
       bodies.push(body);
       const view = createIdeaBubble(body, idea.text, {
-        onDblClick: (v) => this.togglePin(v),
+        onDblClick: (v) => this.handleDblClick(v),
       });
       this.views.set(idea.id, view);
       this.world.appendChild(view.el);
@@ -399,6 +482,15 @@ class App {
     // 🔴 力场的空间分区在这里登记：这个空间之后只和它自己的泡泡互相作用
     this.field.setActiveSpace(space.id);
     this.field.setSpaceBodies(space.id, bodies);
+
+    // 首屏装配：错开一点点播"轻落定"，像星云自己聚拢起来，而不是"啪"地全出现。
+    // 总错开量封顶 380ms —— 再长会让人等。
+    if (this.heartView) playPop(this.heartView.scale, true, 0);
+    let order = 1;
+    for (const view of this.views.values()) {
+      playPop(view.scale, true, Math.min(order * 18, 380));
+      order++;
+    }
 
     // 视口：有记住的就恢复；没有就以心泡泡为屏幕中心、1:1 起步
     const saved = opts.ignoreSaved ? undefined : await this.store.getViewport(space.id);
@@ -424,6 +516,8 @@ class App {
       x = p.x;
       y = p.y;
     }
+    // 尺寸在这里就算好：飞入前要先知道它多大，才能判断落点会不会超出视野
+    const { rx, ry } = radiusOfCached(idea.text);
     return {
       id: idea.id,
       spaceId: idea.spaceId,
@@ -431,8 +525,8 @@ class App {
       y,
       vx: 0,
       vy: 0,
-      rx: 0,
-      ry: 0,
+      rx,
+      ry,
       fixed: false,
       pinned: idea.pinned === 1,
       dragging: false,
@@ -762,29 +856,86 @@ class App {
       archived: 0,
     };
 
-    const bodies = this.field.bodiesOf(space.id);
-
-    // 🔴 本地写入 —— 这一步成功就算"记下来了"
+    // 🔴 本地写入 —— 这一步成功就算"记下来了"。
+    //    飞入动画是锦上添花，绝不能挡在数据前面。
     await this.store.putIdea(idea);
 
     const body = this.bodyFromIdea(idea);
+
+    // 刻意**不 await** 飞入：让输入框立刻空出来，用户能马上记下一条。
+    // 真泡泡在飞完之后才出现（见 launchFlight）。
+    void this.launchFlight(idea, body, space);
+
+    this.updateStatusLine();
+  }
+
+  /**
+   * 把一个刚记下的想法"扔"进星云。
+   *
+   * 🔴 顺序是刻意的：先落库（毫秒级）→ 再飞 → **飞完才把 body 交给力场、才建真泡泡**。
+   *    为什么不在飞的过程中就交给力场：力场会立刻开始推它，
+   *    于是"影子落在哪"和"泡泡出现在哪"就对不上了 —— 会看到一个明显的跳变。
+   */
+  private async launchFlight(idea: Idea, body: Body, space: Space): Promise<void> {
+    // 飞之前先把落点拉进视野，否则影子会飞到屏幕外，人会以为没记上
+    this.ensureVisible(body);
+
+    const from = this.inputCenter();
+    const to = this.worldToStageScreen(body.x, body.y);
+
+    const record = await flyIn({ text: idea.text, from, to });
+
+    // 飞入期间用户可能切了空间。那就先不建视图 —— 数据已经在库里，
+    // 下次打开这个空间时它会自然出现在落点上。
+    if (this.current?.id !== space.id) return;
+
     const view = createIdeaBubble(body, idea.text, {
-      onDblClick: (v) => this.togglePin(v),
+      onDblClick: (v) => this.handleDblClick(v),
     });
     this.views.set(idea.id, view);
     this.world.appendChild(view.el);
+    // 先摆到位再画，避免它从 (0,0) 弹到落点
+    writePosition(view);
 
+    // 🔴 就在这一刻记录真泡泡的位置：再晚一点力场就开始推它了，
+    //    测出来的就变成"力场推了多远"而不是"交接有没有跳"
+    const landedRect = view.el.getBoundingClientRect();
+    record.landedAt = {
+      x: landedRect.left + landedRect.width / 2,
+      y: landedRect.top + landedRect.height / 2,
+    };
+
+    // 落定之后引擎才接手：它会立刻把周围泡泡推开，观感像"掉进池子里"
+    const bodies = this.field.bodiesOf(space.id);
     bodies.push(body);
     this.field.setSpaceBodies(space.id, bodies);
+
+    // "啵"
+    playPop(view.scale);
 
     this.field.wake(0.45);
     this.startLoop();
     this.writeAll();
-
-    // 🔴 刚记下的东西必须看得见 —— 这是"不想错过任何想法"在视口上的落点
-    this.ensureVisible(body);
-
     this.updateStatusLine();
+  }
+
+  /** 输入框中心（视口坐标）—— 飞入的起点。 */
+  private inputCenter(): { x: number; y: number } {
+    const r = this.inputEl.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+
+  /**
+   * world 坐标 → 视口坐标。
+   *
+   * 🔴 需要这一步是因为 `offset-path` 的 path() 坐标是**视口绝对坐标**，
+   *    而泡泡的位置是 world 坐标（还要经过 #stage 的偏移）。少加 rect.left/top
+   *    整条弧线会偏掉一个画布位置，而且偏得很"像对的"，很难一眼看出来。
+   */
+  private worldToStageScreen(x: number, y: number): { x: number; y: number } {
+    const rect = this.stage.getBoundingClientRect();
+    const p = worldToScreen(this.viewport, { x, y });
+    return { x: rect.left + p.x, y: rect.top + p.y };
   }
 
   private updateStatusLine(): void {
@@ -834,6 +985,18 @@ class App {
 
       /** 回全貌（双击空白走的就是这个）。 */
       fitAll: () => this.fitAll(),
+
+      /** 上一次飞入的几何记录（验证"影子落点 == 真泡泡落点"）。 */
+      lastFlight: () => getLastFlight(),
+
+      /** 上一次放大的几何记录（验证形状没有歪、缩放锚点正确）。 */
+      lastZoom: () => getLastZoom(),
+
+      /** 当前是否有放大态开着。 */
+      isZoomed: () => this.zoom !== null,
+
+      /** 关掉放大态（测试用）。 */
+      closeZoom: () => this.closeZoom(),
 
       /** 把待写回的位置立刻落库（测试与关页面前用）。 */
       flushPositions: () => this.flushPositions(true),

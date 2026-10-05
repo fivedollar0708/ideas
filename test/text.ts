@@ -7,7 +7,7 @@
  */
 
 import { close, eq, eqJson, ok, section } from './assert';
-import { clampText, ellipseFromMeasurement, MAX_RADIUS, MIN_RADIUS, norm, scoreMatch, type Measured } from '../src/text';
+import { clampText, ellipseFromMeasurement, MAX_RADIUS, MIN_RADIUS, norm, scoreMatch, shapeOf, type Measured } from '../src/text';
 
 /** 造一个测量结果，省去手写 lines。 */
 function measured(w: number, h: number, lineCount = 1): Measured {
@@ -47,9 +47,13 @@ export function runTextTests(): void {
   eq(four.rx, four.ry, '4 字单行 → 正圆');
   close(four.rx, 46.08, 0.01, '4 字半径 46.08（回归锚点）');
 
-  // 5 字单行：跨出正圆分支，变成椭圆
-  const five = ellipseFromMeasurement(measured(65, 19), 5);
-  ok(five.rx > five.ry, '5 字单行 → 椭圆（宽大于高）');
+  // 8 字单行：仍在正圆阈值内（阈值是 ≤8，与放大态的分档共用）
+  const eight = ellipseFromMeasurement(measured(104, 19), 8);
+  eq(eight.rx, eight.ry, '8 字单行 → 正圆（阈值边界）');
+
+  // 9 字单行：跨出正圆分支，变成椭圆
+  const nine = ellipseFromMeasurement(measured(117, 19), 9);
+  ok(nine.rx > nine.ry, '9 字单行 → 椭圆（宽大于高）');
 
   // 长单行：被 MAX_RADIUS 夹住
   const long = ellipseFromMeasurement(measured(400, 19), 40);
@@ -86,6 +90,17 @@ export function runTextTests(): void {
   ok(aspectOk, '任意测量值下，比例恒在 1:1 ~ 2:1 之间');
   ok(boundOk, '任意测量值下，半径恒不超过 MAX_RADIUS');
   ok(positiveOk, '任意测量值下，半径恒为正的有限数');
+
+  section('text · 形状分档（放大态必须与源同档）');
+
+  eq(shapeOf('水'), 'circle', '单字 → 圆');
+  eq(shapeOf('凌晨三点'), 'circle', '4 字 → 圆');
+  eq(shapeOf('字'.repeat(8)), 'circle', '8 字 → 圆（阈值边界）');
+  eq(shapeOf('字'.repeat(9)), 'card', '9 字 → 卡片');
+  eq(shapeOf('字'.repeat(280)), 'card', '长文本 → 卡片');
+  // 换行不该影响分档（换行只是排版，不是字数）
+  eq(shapeOf('一二三\n四五六'), 'circle', '含换行的 6 字 → 圆（换行不计入）');
+  eq(shapeOf('一二三四五\n六七八九十'), 'card', '跨行 10 字 → 卡片');
 
   section('text · scoreMatch · 权重梯度');
 

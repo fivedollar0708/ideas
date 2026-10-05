@@ -100,8 +100,8 @@ export interface DragHooks {
   onDragMove(body: Body): void;
   /** 松手。velocity 是甩出速度（world/秒），已由最近采样算出。 */
   onDrop(body: Body, velocity: { x: number; y: number }): void;
-  /** 判定为点击。阶段 4 在这里接"放大到屏幕中央"。 */
-  onTap(body: Body): void;
+  /** 判定为点击。`at` 是点击位置（视口坐标），放大动画需要它来定缩放锚点。 */
+  onTap(body: Body, at: { x: number; y: number }): void;
 }
 
 export interface DragHandle {
@@ -189,7 +189,9 @@ export function mountDrag(stage: HTMLElement, hooks: DragHooks): DragHandle {
       return;
     }
 
-    if (!cancelled && classifyGesture(samples) === 'tap') hooks.onTap(target);
+    if (!cancelled && classifyGesture(samples) === 'tap') {
+      hooks.onTap(target, { x: e.clientX, y: e.clientY });
+    }
   };
 
   const onPointerUp = (e: PointerEvent): void => finish(e, false);

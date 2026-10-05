@@ -80,7 +80,9 @@
         hooks.onDrop(target, velocity);
         return;
       }
-      if (!cancelled && classifyGesture(samples) === "tap") hooks.onTap(target);
+      if (!cancelled && classifyGesture(samples) === "tap") {
+        hooks.onTap(target, { x: e.clientX, y: e.clientY });
+      }
     };
     const onPointerUp = (e) => finish(e, false);
     const onPointerCancel = (e) => finish(e, true);
@@ -390,7 +392,7 @@
   var HEART_MAX_RADIUS = 88;
   var HEART_NAME_MEASURE_MAX = 12;
   var SPACE_RESTORE_SUFFIX = "\uFF08\u6062\u590D\uFF09";
-  var SPAWN_MIN_RADIUS = 130;
+  var SPAWN_MIN_RADIUS = 200;
   var SPAWN_MAX_RADIUS = 320;
 
   // src/text.ts
@@ -399,6 +401,11 @@
   var LINE_HEIGHT_RATIO = 1.45;
   var MIN_RADIUS = 26;
   var MAX_RADIUS = 78;
+  var CIRCLE_MAX_CHARS = 8;
+  function shapeOf(text) {
+    const flat = text.replace(/\n/g, "");
+    return flat.length <= CIRCLE_MAX_CHARS ? "circle" : "card";
+  }
   var PAD_X = 22;
   var PAD_Y = 18;
   var MIN_LINE_CAP = 56;
@@ -435,7 +442,7 @@
       h = minR * 0.7;
       w = h * aspect;
     }
-    if (m.lines.length <= 1 && textLength <= 4) {
+    if (m.lines.length <= 1 && textLength <= CIRCLE_MAX_CHARS) {
       const r = clampNumber(Math.max(w, h), minR, maxR);
       return { rx: r, ry: r };
     }
@@ -573,9 +580,15 @@
   }
   function applyAccent(worldEl, hue) {
     const accent = hueAccent(hue);
+    const soft = hueSoft(hue);
+    const line = `${accent}55`;
     worldEl.style.setProperty("--accent", accent);
-    worldEl.style.setProperty("--accent-soft", hueSoft(hue));
-    worldEl.style.setProperty("--accent-line", `${accent}55`);
+    worldEl.style.setProperty("--accent-soft", soft);
+    worldEl.style.setProperty("--accent-line", line);
+    const root = document.documentElement;
+    root.style.setProperty("--accent", accent);
+    root.style.setProperty("--accent-soft", soft);
+    root.style.setProperty("--accent-line", line);
   }
   function makeShell() {
     const el = document.createElement("div");
@@ -591,15 +604,11 @@
     el.appendChild(scale);
     return { el, scale, inner };
   }
-  function markEntering(inner) {
-    inner.classList.add("is-entering");
-    inner.addEventListener(
-      "animationend",
-      () => {
-        inner.classList.remove("is-entering");
-      },
-      { once: true }
-    );
+  function setDragging(view, dragging) {
+    view.el.classList.toggle("bubble--dragging", dragging);
+  }
+  function setHidden(view, hidden) {
+    view.el.classList.toggle("bubble--hidden", hidden);
   }
   function bindHandlers(view, handlers) {
     const onClick = (e) => handlers.onClick?.(view, e);
@@ -632,8 +641,7 @@
     label.style.fontSize = `${FONT_SIZE}px`;
     inner.style.setProperty("--lines", String(fitLines(ry)));
     inner.appendChild(label);
-    markEntering(inner);
-    const view = { el, scale, inner, body, destroy: () => {
+    const view = { el, scale, inner, body, text, destroy: () => {
     } };
     const unbind = bindHandlers(view, handlers);
     view.destroy = () => {
@@ -663,8 +671,7 @@
     hint.textContent = "\u5207\u6362\u7A7A\u95F4";
     inner.appendChild(label);
     inner.appendChild(hint);
-    markEntering(inner);
-    const view = { el, scale, inner, body, destroy: () => {
+    const view = { el, scale, inner, body, text: name, destroy: () => {
     } };
     const unbind = bindHandlers(view, handlers);
     view.destroy = () => {
@@ -690,6 +697,328 @@
     view.el.style.height = `${r * 2}px`;
     view.el.style.marginLeft = `${-r}px`;
     view.el.style.marginTop = `${-r}px`;
+  }
+
+  // src/render/flyIn.ts
+  var FLY_MS = 540;
+  var POP_MS = 240;
+  var ARC_LIFT_MIN = 60;
+  var ARC_LIFT_MAX = 120;
+  var RIPPLE_SCALE = 2.2;
+  var POP_START = 0.15;
+  var POP_OVERSHOOT = 1.22;
+  var POP_UNDERSHOOT = 0.92;
+  var POP_SETTLE = 1.05;
+  var POP_LOAD_START = 0.72;
+  var FX_ID = "nebula-fx";
+  function arcControlPoint(from, to, lift) {
+    return {
+      x: (from.x + to.x) / 2,
+      y: (from.y + to.y) / 2 - lift
+    };
+  }
+  function pathDataFor(from, control, to) {
+    const r = (n) => Math.round(n * 100) / 100;
+    return `path("M ${r(from.x)} ${r(from.y)} Q ${r(control.x)} ${r(control.y)} ${r(to.x)} ${r(to.y)}")`;
+  }
+  function popKeyframes(start = POP_START, overshoot = POP_OVERSHOOT, undershoot = POP_UNDERSHOOT, settle = POP_SETTLE) {
+    const scale = (s) => ({ transform: `scale(${s})` });
+    return [
+      { ...scale(start), offset: 0 },
+      { ...scale(overshoot), offset: 0.42 },
+      { ...scale(undershoot), offset: 0.68 },
+      { ...scale(settle), offset: 0.86 },
+      { ...scale(1), offset: 1 }
+    ];
+  }
+  function loadPopKeyframes() {
+    return [
+      { transform: `scale(${POP_LOAD_START})`, opacity: "0", offset: 0 },
+      { transform: "scale(1.04)", opacity: "1", offset: 0.7 },
+      { transform: "scale(1)", opacity: "1", offset: 1 }
+    ];
+  }
+  function rippleKeyframes() {
+    return [
+      { transform: "scale(0.6)", opacity: "1", offset: 0 },
+      { transform: `scale(${RIPPLE_SCALE})`, opacity: "0", offset: 1 }
+    ];
+  }
+  function prefersReducedMotion() {
+    return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+  function ensureFxLayer() {
+    const existing = document.getElementById(FX_ID);
+    if (existing) return existing;
+    const layer = document.createElement("div");
+    layer.id = FX_ID;
+    layer.className = "fx-layer";
+    document.body.appendChild(layer);
+    return layer;
+  }
+  function buildShadow(text, rx, ry) {
+    const el = document.createElement("div");
+    el.className = "bubble bubble--idea bubble--shadow";
+    el.dataset.role = "shadow";
+    el.style.width = `${rx * 2}px`;
+    el.style.height = `${ry * 2}px`;
+    const scale = document.createElement("div");
+    scale.className = "bubble-scale";
+    const inner = document.createElement("div");
+    inner.className = "bubble-inner";
+    const lines = Math.max(1, Math.floor((2 * ry - 12) / lineHeight()));
+    inner.style.setProperty("--lines", String(lines));
+    const label = document.createElement("div");
+    label.className = "bubble-label";
+    label.textContent = text;
+    inner.appendChild(label);
+    scale.appendChild(inner);
+    el.appendChild(scale);
+    return el;
+  }
+  function spawnRipple(at) {
+    const layer = ensureFxLayer();
+    const el = document.createElement("div");
+    el.className = "ripple";
+    el.style.left = `${at.x}px`;
+    el.style.top = `${at.y}px`;
+    layer.appendChild(el);
+    const anim = el.animate(rippleKeyframes(), {
+      duration: 460,
+      easing: "cubic-bezier(.2,.7,.4,1)"
+    });
+    anim.finished.catch(() => void 0).then(() => el.remove());
+  }
+  var lastFlight = null;
+  function getLastFlight() {
+    return lastFlight;
+  }
+  async function flyIn(req) {
+    const { text, from, to } = req;
+    const { rx, ry } = radiusOfCached(text);
+    const lift = req.lift ?? ARC_LIFT_MIN + (ARC_LIFT_MAX - ARC_LIFT_MIN) * 0.5;
+    const control = arcControlPoint(from, to, lift);
+    const record = { from, control, to, shadowEnd: null, landedAt: null };
+    lastFlight = record;
+    if (prefersReducedMotion()) {
+      spawnRipple(to);
+      record.shadowEnd = { ...to };
+      return record;
+    }
+    const layer = ensureFxLayer();
+    const shadow = buildShadow(text, rx, ry);
+    shadow.style.offsetPath = pathDataFor(from, control, to);
+    layer.appendChild(shadow);
+    const anim = shadow.animate(
+      [{ offsetDistance: "0%" }, { offsetDistance: "100%" }],
+      {
+        duration: FLY_MS,
+        easing: "cubic-bezier(.3,.1,.35,1)",
+        // 🔴 必须 fill: 'forwards'。默认的 'none' 会在动画一结束就把 offset-distance
+        //    弹回基础值（0%），于是"影子已经飞到了"这件事在测量时根本看不到 ——
+        //    实测表现为落点与终点差了整整一个飞行距离（694px）。
+        //    这里加 fill 是安全的：影子下一行就被销毁，不存在"fill 压住 hover"的问题。
+        fill: "forwards"
+      }
+    );
+    try {
+      await anim.finished;
+    } catch {
+    }
+    const rect = shadow.getBoundingClientRect();
+    record.shadowEnd = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    shadow.remove();
+    spawnRipple(to);
+    return record;
+  }
+  function playPop(scaleEl, light = false, delay = 0) {
+    if (prefersReducedMotion()) return;
+    const frames = light ? loadPopKeyframes() : popKeyframes();
+    const anim = scaleEl.animate(frames, {
+      duration: light ? 260 : POP_MS,
+      delay,
+      easing: "linear",
+      // 🔴 必须用 'backwards' 而不是 'both'：
+      //    'both' 会连**结束值**也保留下来，于是动画结束后它一直压着 hover 的 transform，
+      //    悬停就永久失效（阶段 2 踩过这个坑）。
+      //    'backwards' 只在 delay 期间保留起始值（否则带 delay 的首屏装配会先闪一下全尺寸），
+      //    结束后一切交还给 CSS。
+      fill: "backwards"
+    });
+    anim.finished.catch(() => void 0);
+  }
+
+  // src/render/zoom.ts
+  var ZOOM_IN_MS = 320;
+  var ZOOM_OUT_MS = 220;
+  var ZOOM_MAX_W = 620;
+  var ZOOM_MAX_H = 0.62;
+  var ZOOM_MAX_SCALE = 3.4;
+  var ZOOM_MAX_FONT = FONT_SIZE * ZOOM_MAX_SCALE;
+  var ZOOM_MIN_FONT = 13;
+  var LINE_HEIGHT_RATIO2 = 1.45;
+  var ZOOM_ID = "nebula-zoom";
+  function zoomScaleFor(src, fit) {
+    if (src.w <= 0 || src.h <= 0) return 1;
+    const byFit = Math.min(fit.maxW / src.w, fit.maxH / src.h);
+    return Math.max(1, Math.min(fit.maxScale, byFit));
+  }
+  function zoomTargetRect(src, scale, viewport) {
+    const w = src.w * scale;
+    const h = src.h * scale;
+    return { x: (viewport.w - w) / 2, y: (viewport.h - h) / 2, w, h };
+  }
+  function computeZoomTransform(src, target, pointer) {
+    const k = target.w > 0 ? src.w / target.w : 1;
+    const ox = (pointer.x - src.x) / k;
+    const oy = (pointer.y - src.y) / k;
+    const tx = src.x - target.x - ox * (1 - k);
+    const ty = src.y - target.y - oy * (1 - k);
+    return {
+      origin: { x: ox, y: oy },
+      start: { x: tx, y: ty },
+      k,
+      startTransform: `translate(${round(tx)}px, ${round(ty)}px) scale(${round(k, 5)})`
+    };
+  }
+  function round(n, digits = 3) {
+    const f = 10 ** digits;
+    return Math.round(n * f) / f;
+  }
+  function zoomRadiusFor(shape, target) {
+    return shape === "circle" ? "50%" : `${Math.round(Math.min(target.w, target.h) * 0.12)}px`;
+  }
+  function zoomFontSize(text, target, scale) {
+    const len = Math.max(1, text.replace(/\n/g, "").length);
+    const usableW = Math.max(8, target.w - 20 * scale);
+    const usableH = Math.max(8, target.h - 16 * scale);
+    let best = ZOOM_MIN_FONT;
+    for (let lines = 1; lines <= 64; lines++) {
+      const perLine = Math.ceil(len / lines);
+      const byWidth = usableW / perLine;
+      const byHeight = usableH / (lines * LINE_HEIGHT_RATIO2);
+      const font = Math.min(byWidth, byHeight);
+      if (font > best) best = font;
+    }
+    const byScale = FONT_SIZE * scale;
+    const chosen = Math.min(best, byScale);
+    return Math.max(ZOOM_MIN_FONT, Math.min(ZOOM_MAX_FONT, chosen));
+  }
+  var lastZoom = null;
+  function getLastZoom() {
+    return lastZoom;
+  }
+  function planZoom(src, pointer, viewport, text) {
+    const shape = shapeOf(text);
+    const scale = zoomScaleFor(src, {
+      maxW: Math.min(ZOOM_MAX_W, viewport.w - 64),
+      maxH: viewport.h * ZOOM_MAX_H,
+      maxScale: ZOOM_MAX_SCALE
+    });
+    const target = zoomTargetRect(src, scale, viewport);
+    return { src, target, pointer, transform: computeZoomTransform(src, target, pointer), shape, scale };
+  }
+  function ensureZoomLayer() {
+    const existing = document.getElementById(ZOOM_ID);
+    if (existing) return existing;
+    const layer = document.createElement("div");
+    layer.id = ZOOM_ID;
+    layer.className = "zoom-layer";
+    layer.hidden = true;
+    document.body.appendChild(layer);
+    return layer;
+  }
+  function buildClone(text, target, record) {
+    const el = document.createElement("div");
+    el.className = "bubble bubble--idea bubble--zoom";
+    el.style.left = `${target.x}px`;
+    el.style.top = `${target.y}px`;
+    el.style.width = `${target.w}px`;
+    el.style.height = `${target.h}px`;
+    el.style.transformOrigin = `${record.transform.origin.x}px ${record.transform.origin.y}px`;
+    const scale = document.createElement("div");
+    scale.className = "bubble-scale";
+    const inner = document.createElement("div");
+    inner.className = "bubble-inner";
+    inner.style.borderRadius = zoomRadiusFor(record.shape, target);
+    inner.style.padding = `${8 * record.scale}px ${10 * record.scale}px`;
+    inner.style.setProperty("--lines", "99");
+    const label = document.createElement("div");
+    label.className = "bubble-label";
+    label.textContent = text;
+    label.style.fontSize = `${zoomFontSize(text, target, record.scale)}px`;
+    inner.appendChild(label);
+    scale.appendChild(inner);
+    el.appendChild(scale);
+    return el;
+  }
+  function openZoom(opts) {
+    const layer = ensureZoomLayer();
+    const rect = layer.getBoundingClientRect();
+    const viewport = { w: rect.width || window.innerWidth, h: rect.height || window.innerHeight };
+    const record = planZoom(opts.srcRect, opts.pointer, viewport, opts.text);
+    lastZoom = record;
+    const backdrop = document.createElement("div");
+    backdrop.className = "zoom-backdrop";
+    const clone = buildClone(opts.text, record.target, record);
+    layer.replaceChildren(backdrop, clone);
+    layer.hidden = false;
+    layer.classList.add("zoom-layer--visible");
+    let closed = false;
+    const anim = clone.animate(
+      [{ transform: record.transform.startTransform }, { transform: "none" }],
+      {
+        duration: ZOOM_IN_MS,
+        easing: "cubic-bezier(.2,.85,.3,1.02)",
+        fill: "backwards"
+      }
+    );
+    backdrop.animate([{ opacity: "0" }, { opacity: "1" }], {
+      duration: ZOOM_IN_MS,
+      easing: "ease-out"
+    }).finished.catch(() => void 0);
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") close();
+    };
+    function close() {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener("keydown", onKeyDown, true);
+      const fade = clone.animate(
+        [{ transform: "none" }, { transform: record.transform.startTransform }],
+        {
+          duration: ZOOM_OUT_MS,
+          easing: "cubic-bezier(.4,0,.7,.4)",
+          // 收回时用 'forwards'：动画结束到元素被移除之间有几十毫秒，
+          // 不加的话会先弹回全尺寸再消失（闪一下）。
+          fill: "forwards"
+        }
+      );
+      backdrop.animate([{ opacity: "1" }, { opacity: "0" }], {
+        duration: ZOOM_OUT_MS,
+        easing: "ease-in"
+      });
+      fade.finished.catch(() => void 0).then(() => {
+        layer.classList.remove("zoom-layer--visible");
+        layer.hidden = true;
+        layer.replaceChildren();
+        opts.onClose?.();
+      });
+    }
+    clone.addEventListener("click", (e) => {
+      e.stopPropagation();
+      close();
+    });
+    backdrop.addEventListener("click", close);
+    document.addEventListener("keydown", onKeyDown, true);
+    anim.finished.catch(() => void 0);
+    void anim;
+    return {
+      close,
+      get isOpen() {
+        return !closed;
+      }
+    };
   }
 
   // src/store.ts
@@ -1436,6 +1765,9 @@
   function identityViewport() {
     return { scale: 1, tx: 0, ty: 0 };
   }
+  function worldToScreen(vp, p) {
+    return { x: p.x * vp.scale + vp.tx, y: p.y * vp.scale + vp.ty };
+  }
   function screenToWorld(vp, p) {
     return { x: (p.x - vp.tx) / vp.scale, y: (p.y - vp.ty) / vp.scale };
   }
@@ -1484,6 +1816,7 @@
 
   // src/main.ts
   var HEART_ID = "__heart__";
+  var DOUBLE_CLICK_GUARD_MS = 220;
   function must(selector) {
     const el = document.querySelector(selector);
     if (!el) throw new Error(`\u9875\u9762\u7F3A\u5C11\u5FC5\u9700\u7684\u5143\u7D20\uFF1A${selector}`);
@@ -1526,6 +1859,8 @@
     frameIndex = 0;
     viewportSaveTimer = 0;
     drag = null;
+    /** 当前打开的放大态。同一时刻只允许一个。 */
+    zoom = null;
     /**
      * 拖拽过、但还没把最终坐标写回数据库的 idea。
      * 值是该位置的"被放下时刻"（写进 movedAt，不是写入时刻 —— 两者差几百毫秒，
@@ -1533,6 +1868,8 @@
      */
     pendingPosition = /* @__PURE__ */ new Map();
     positionSaveTimer = 0;
+    /** 待处理的单击（等双击判别窗口过去才真正放大）。 */
+    tapTimer = 0;
     constructor() {
       this.stage = must("#stage");
       this.world = must("#world");
@@ -1573,6 +1910,8 @@
         onDragStart: (body) => {
           body.vx = 0;
           body.vy = 0;
+          const view = this.views.get(body.id);
+          if (view) setDragging(view, true);
           this.field.wake(0.35);
           this.startLoop();
         },
@@ -1581,15 +1920,70 @@
           this.startLoop();
         },
         onDrop: (body, velocity) => {
+          const view = this.views.get(body.id);
+          if (view) setDragging(view, false);
           body.vx = velocity.x;
           body.vy = velocity.y;
           this.field.wake(0.5);
           this.startLoop();
           this.schedulePositionSave(body.id, Date.now());
         },
-        onTap: () => {
+        onTap: (body, at) => {
+          const view = this.views.get(body.id);
+          if (view) this.handleTap(view, at);
         }
       });
+    }
+    /**
+     * 单击泡泡。
+     *
+     * 🔴 这里必须**延迟 220ms 再放大**，因为单击（放大）和双击（锁定）落在同一个元素上，
+     *    天然冲突：如果单击立刻打开放大浮层，第二次点击就会打在浮层的遮罩上，
+     *    dblclick 永远收不到 —— 表现是"双击锁定失灵"（阶段 4 实测踩到）。
+     *    延迟这段时间用来等"是不是双击"。
+     *
+     *    代价是放大有 220ms 的延迟。取舍：锁定是个低频动作，但双击一旦失灵就是彻底坏掉，
+     *    所以宁可让放大稍钝一点。
+     */
+    handleTap(view, at) {
+      window.clearTimeout(this.tapTimer);
+      this.tapTimer = window.setTimeout(() => {
+        this.tapTimer = 0;
+        this.zoomToCenter(view, at);
+      }, DOUBLE_CLICK_GUARD_MS);
+    }
+    /** 双击泡泡 → 切换锁定。同时取消那次待处理的单击。 */
+    handleDblClick(view) {
+      window.clearTimeout(this.tapTimer);
+      this.tapTimer = 0;
+      this.togglePin(view);
+    }
+    // ── 放大到中央（FLIP）────────────────────────────────
+    /**
+     * 点一个泡泡 → 放大到屏幕中央。
+     *
+     * 做法是**克隆**而不是直接动真泡泡：真泡泡住在被 translate+scale 变换过的 #world 里，
+     * 把它拖出来做 FLIP 会先经历一次坐标系跳变，而且它每帧还被力导向写 transform。
+     * 克隆到 body 下的固定图层里动画，真泡泡只暂时隐藏，收回时原地复活、位置分毫不动。
+     */
+    zoomToCenter(view, pointer) {
+      if (this.zoom) return;
+      const domRect = view.el.getBoundingClientRect();
+      const srcRect = { x: domRect.left, y: domRect.top, w: domRect.width, h: domRect.height };
+      setHidden(view, true);
+      this.zoom = openZoom({
+        text: view.text,
+        srcRect,
+        pointer,
+        onClose: () => {
+          setHidden(view, false);
+          this.zoom = null;
+        }
+      });
+    }
+    /** 关掉放大态（切空间、重命名等会改动布局的操作前调用）。 */
+    closeZoom() {
+      this.zoom?.close();
     }
     /** 记下"这个泡泡被拖过"，等星云停稳再落库。 */
     schedulePositionSave(ideaId, movedAt) {
@@ -1720,6 +2114,7 @@
     }
     // ── 打开一个空间 ──────────────────────────────────────
     async openSpace(space, opts = {}) {
+      this.closeZoom();
       this.current = space;
       await this.store.setLastSpaceId(space.id);
       for (const view of this.views.values()) view.destroy();
@@ -1753,13 +2148,19 @@
         const body = this.bodyFromIdea(idea);
         bodies.push(body);
         const view = createIdeaBubble(body, idea.text, {
-          onDblClick: (v) => this.togglePin(v)
+          onDblClick: (v) => this.handleDblClick(v)
         });
         this.views.set(idea.id, view);
         this.world.appendChild(view.el);
       }
       this.field.setActiveSpace(space.id);
       this.field.setSpaceBodies(space.id, bodies);
+      if (this.heartView) playPop(this.heartView.scale, true, 0);
+      let order = 1;
+      for (const view of this.views.values()) {
+        playPop(view.scale, true, Math.min(order * 18, 380));
+        order++;
+      }
       const saved = opts.ignoreSaved ? void 0 : await this.store.getViewport(space.id);
       this.viewport = saved ?? this.centeredViewport();
       this.applyViewport();
@@ -1781,6 +2182,7 @@
         x = p.x;
         y = p.y;
       }
+      const { rx, ry } = radiusOfCached(idea.text);
       return {
         id: idea.id,
         spaceId: idea.spaceId,
@@ -1788,8 +2190,8 @@
         y,
         vx: 0,
         vy: 0,
-        rx: 0,
-        ry: 0,
+        rx,
+        ry,
         fixed: false,
         pinned: idea.pinned === 1,
         dragging: false
@@ -2056,21 +2458,60 @@
         linksAlwaysOn: 0,
         archived: 0
       };
-      const bodies = this.field.bodiesOf(space.id);
       await this.store.putIdea(idea);
       const body = this.bodyFromIdea(idea);
+      void this.launchFlight(idea, body, space);
+      this.updateStatusLine();
+    }
+    /**
+     * 把一个刚记下的想法"扔"进星云。
+     *
+     * 🔴 顺序是刻意的：先落库（毫秒级）→ 再飞 → **飞完才把 body 交给力场、才建真泡泡**。
+     *    为什么不在飞的过程中就交给力场：力场会立刻开始推它，
+     *    于是"影子落在哪"和"泡泡出现在哪"就对不上了 —— 会看到一个明显的跳变。
+     */
+    async launchFlight(idea, body, space) {
+      this.ensureVisible(body);
+      const from = this.inputCenter();
+      const to = this.worldToStageScreen(body.x, body.y);
+      const record = await flyIn({ text: idea.text, from, to });
+      if (this.current?.id !== space.id) return;
       const view = createIdeaBubble(body, idea.text, {
-        onDblClick: (v) => this.togglePin(v)
+        onDblClick: (v) => this.handleDblClick(v)
       });
       this.views.set(idea.id, view);
       this.world.appendChild(view.el);
+      writePosition(view);
+      const landedRect = view.el.getBoundingClientRect();
+      record.landedAt = {
+        x: landedRect.left + landedRect.width / 2,
+        y: landedRect.top + landedRect.height / 2
+      };
+      const bodies = this.field.bodiesOf(space.id);
       bodies.push(body);
       this.field.setSpaceBodies(space.id, bodies);
+      playPop(view.scale);
       this.field.wake(0.45);
       this.startLoop();
       this.writeAll();
-      this.ensureVisible(body);
       this.updateStatusLine();
+    }
+    /** 输入框中心（视口坐标）—— 飞入的起点。 */
+    inputCenter() {
+      const r = this.inputEl.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+    /**
+     * world 坐标 → 视口坐标。
+     *
+     * 🔴 需要这一步是因为 `offset-path` 的 path() 坐标是**视口绝对坐标**，
+     *    而泡泡的位置是 world 坐标（还要经过 #stage 的偏移）。少加 rect.left/top
+     *    整条弧线会偏掉一个画布位置，而且偏得很"像对的"，很难一眼看出来。
+     */
+    worldToStageScreen(x, y) {
+      const rect = this.stage.getBoundingClientRect();
+      const p = worldToScreen(this.viewport, { x, y });
+      return { x: rect.left + p.x, y: rect.top + p.y };
     }
     updateStatusLine() {
       if (!this.current) return;
@@ -2109,6 +2550,14 @@
         isDragging: () => this.drag?.isDragging ?? false,
         /** 回全貌（双击空白走的就是这个）。 */
         fitAll: () => this.fitAll(),
+        /** 上一次飞入的几何记录（验证"影子落点 == 真泡泡落点"）。 */
+        lastFlight: () => getLastFlight(),
+        /** 上一次放大的几何记录（验证形状没有歪、缩放锚点正确）。 */
+        lastZoom: () => getLastZoom(),
+        /** 当前是否有放大态开着。 */
+        isZoomed: () => this.zoom !== null,
+        /** 关掉放大态（测试用）。 */
+        closeZoom: () => this.closeZoom(),
         /** 把待写回的位置立刻落库（测试与关页面前用）。 */
         flushPositions: () => this.flushPositions(true),
         /**

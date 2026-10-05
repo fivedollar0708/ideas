@@ -134,7 +134,14 @@ async function waitUntil(cdp, expression, timeoutMs = 8000) {
   return false;
 }
 
-async function typeAndEnter(cdp, text) {
+/**
+ * 打一条想法并回车。
+ *
+ * 🔴 默认会**等飞入落定**（影子消失）再返回 —— 阶段 4 起"回车"不再立刻产生泡泡，
+ *    真泡泡要等 540ms 的弧线飞完才出现。早期那几条"回车后出现 1 个泡泡"的断言
+ *    因此全都少数了一个（踩过）。要观察飞行途中的状态就传 waitForLanding = false。
+ */
+async function typeAndEnter(cdp, text, waitMs = 240, waitForLanding = true) {
   await evaluate(cdp, `document.querySelector('#input').focus()`);
   await cdp.send('Input.insertText', { text });
   await sleep(60);
@@ -147,7 +154,11 @@ async function typeAndEnter(cdp, text) {
       nativeVirtualKeyCode: 13,
     });
   }
-  await sleep(240);
+  await sleep(waitMs);
+  if (waitForLanding) {
+    await waitUntil(cdp, `!document.querySelector('.bubble--shadow')`, 5000);
+    await sleep(150);
+  }
 }
 
 /** 取某个元素的中心（视口坐标）。 */
@@ -230,6 +241,18 @@ async function doubleClick(cdp, selector) {
   await sleep(200);
 }
 
+/**
+ * 等星云彻底停稳。
+ *
+ * 🔴 用真实鼠标点击做测试之前**必须**先调它：力场还在跑的时候泡泡是移动的，
+ *    而"算出中心点"和"真正点下去"之间隔了几十毫秒 —— 泡泡一移，点就落空了。
+ *    表现是随机的"双击没生效""拖拽没反应"，非常难查（本机踩过）。
+ */
+async function settle(cdp, timeoutMs = 20000) {
+  await waitUntil(cdp, `window.__nebula.field.tier() === 'asleep'`, timeoutMs);
+  await sleep(150);
+}
+
 // ── 断言 ──────────────────────────────────────────────
 
 let passed = 0;
@@ -246,8 +269,8 @@ function ok(condition, message, extra = '') {
 }
 
 // 页面里常用的取值表达式
-const IDEA_COUNT = `document.querySelectorAll('.bubble--idea').length`;
-const IDEA_TEXTS = `Array.from(document.querySelectorAll('.bubble--idea .bubble-label')).map(e=>e.textContent)`;
+const IDEA_COUNT = `document.querySelectorAll('.bubble--idea:not(.bubble--shadow)').length`;
+const IDEA_TEXTS = `Array.from(document.querySelectorAll('.bubble--idea:not(.bubble--shadow) .bubble-label')).map(e=>e.textContent)`;
 const HEART_TEXT = `document.querySelector('.bubble--heart .bubble-label')?.textContent ?? ''`;
 
 async function main() {
@@ -332,7 +355,7 @@ async function main() {
     await typeAndEnter(cdp, '长'.repeat(300));
     const longLen = await evaluate(
       cdp,
-      `Math.max(...Array.from(document.querySelectorAll('.bubble--idea .bubble-label')).map(e=>e.textContent.length))`,
+      `Math.max(...Array.from(document.querySelectorAll('.bubble--idea:not(.bubble--shadow) .bubble-label')).map(e=>e.textContent.length))`,
     );
     ok(longLen === 280, '超长文本截断到 280 字', `实际 ${longLen}`);
 
@@ -388,10 +411,22 @@ async function main() {
     await sleep(1500); // 让 B 的力导向充分跑一段时间
     const aPositionsAfter = JSON.stringify(await evaluate(cdp, `window.__nebula.positions(${JSON.stringify(spaceA)})`));
 
+    let isoDiff = '';
+    if (aPositionsBefore !== aPositionsAfter) {
+      const before = JSON.parse(aPositionsBefore);
+      const after = JSON.parse(aPositionsAfter);
+      isoDiff = before
+        .map((b, i) => {
+          const a = after[i] ?? {};
+          const d = Math.hypot((a.x ?? 0) - b.x, (a.y ?? 0) - b.y);
+          return `#${i} 移动 ${d.toFixed(3)}px`;
+        })
+        .join(' / ');
+    }
     ok(
       aPositionsBefore === aPositionsAfter,
       '模拟 B 空间 1.5 秒后，A 空间的泡泡坐标完全没变',
-      aPositionsBefore === aPositionsAfter ? '' : `${aPositionsBefore} → ${aPositionsAfter}`,
+      isoDiff,
     );
 
     const bMoved = await evaluate(
@@ -412,7 +447,7 @@ async function main() {
     );
     ok(afterDelete.startsWith('1|'), '删除后只剩 1 个空间');
     ok(
-      (await evaluate(cdp, `document.querySelectorAll('.bubble--idea').length`)) === 3,
+      (await evaluate(cdp, `document.querySelectorAll('.bubble--idea:not(.bubble--shadow)').length`)) === 3,
       '当前空间是 A，泡泡仍是 3 个（删除 B 没影响 A）',
     );
 
@@ -467,14 +502,13 @@ async function main() {
     await sleep(800);
     // 先把全部泡泡收进视野，保证后面用真实鼠标点得到它们
     await evaluate(cdp, `window.__nebula.fitAll()`);
-    await sleep(300);
-    await waitUntil(cdp, `window.__nebula.field.tier() === 'asleep'`, 20000);
+    await settle(cdp);
 
     const targetId = await evaluate(
       cdp,
       `(() => {
         const stage = document.querySelector('#stage').getBoundingClientRect();
-        const inside = Array.from(document.querySelectorAll('.bubble--idea')).find((el) => {
+        const inside = Array.from(document.querySelectorAll('.bubble--idea:not(.bubble--shadow)')).find((el) => {
           const r = el.getBoundingClientRect();
           return r.left >= stage.left + 4 && r.top >= stage.top + 4 &&
                  r.right <= stage.right - 4 && r.bottom <= stage.bottom - 4;
@@ -514,6 +548,22 @@ async function main() {
 
     ok(await evaluate(cdp, `window.__nebula.isDragging()`), '越过 8px 阈值后进入了拖拽状态');
 
+    // 🔴 拖拽中必须关掉 hover 效果，否则会"一边拖一边胀大"
+    const dragCls = await evaluate(
+      cdp,
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(bubbleSel)});
+        return { cls: el.classList.contains('bubble--dragging'),
+                 scale: getComputedStyle(el.querySelector('.bubble-scale')).transform };
+      })()`,
+    );
+    ok(dragCls.cls, '拖拽中的泡泡带上了 bubble--dragging');
+    ok(
+      dragCls.scale === 'none' || dragCls.scale === 'matrix(1, 0, 0, 1, 0, 0)',
+      '拖拽中缩放被压住（没有 hover 效果）',
+      dragCls.scale,
+    );
+
     // 🔴 按住不动 250ms：坐标必须一动不动。
     //    如果引擎还在写它，这里会看到抖动或被"吸回"。
     const holdA = await evaluate(cdp, `JSON.stringify(window.__nebula.bodyState(${JSON.stringify(targetId)}))`);
@@ -540,7 +590,7 @@ async function main() {
     ok(atRelease.dragging === false, '松手后 dragging 标记立刻清掉');
 
     // 等它滑完并落库
-    await waitUntil(cdp, `window.__nebula.field.tier() === 'asleep'`, 20000);
+    await settle(cdp);
     await sleep(700);
 
     const settled = JSON.parse(
@@ -595,6 +645,8 @@ async function main() {
 
     console.log('\n── 双击锁定（阶段 3） ──');
 
+    // 刷新之后力场从 0.6 开始重新收敛，此时泡泡是动的 —— 必须先停稳再点
+    await settle(cdp);
     await doubleClick(cdp, bubbleSel);
     ok(
       (await evaluate(cdp, `window.__nebula.storedIdea(${JSON.stringify(targetId)}).then(i => i.pinned)`)) === 1,
@@ -659,7 +711,7 @@ async function main() {
     const hitProbe = await evaluate(
       cdp,
       `(() => {
-        const el = document.querySelector('.bubble--idea');
+        const el = document.querySelector('.bubble--idea:not(.bubble--shadow)');
         if (!el) return { ok: false, why: '没有想法泡泡' };
         const r = el.getBoundingClientRect();
         const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
@@ -699,6 +751,426 @@ async function main() {
       })()`,
     );
     ok(heartHit, '心泡泡中心点上的元素就是心泡泡本身');
+
+    console.log('\n── 飞入动画（阶段 4） ──');
+
+    await evaluate(cdp, `window.__nebula.fitAll()`);
+    await sleep(300);
+
+    const FLY_TEXT = '飞进来的想法';
+    // 只等很短的时间、且不等落定 —— 好在飞行途中取样
+    await typeAndEnter(cdp, FLY_TEXT, 150, false);
+
+    const midFlight = await evaluate(
+      cdp,
+      `(() => ({
+        shadow: !!document.querySelector('.bubble--shadow'),
+        inFxLayer: !!document.querySelector('.fx-layer .bubble--shadow'),
+        realBubble: Array.from(document.querySelectorAll('.bubble--idea:not(.bubble--shadow)'))
+          .some(e => e.querySelector('.bubble-label').textContent === ${JSON.stringify(FLY_TEXT)}),
+      }))()`,
+    );
+    ok(midFlight.shadow, '飞行途中存在影子泡泡（而不是直接动画真泡泡）', JSON.stringify(midFlight));
+    ok(midFlight.inFxLayer, '影子住在 body 下的固定图层里（不受 #world 的二次变换影响）');
+    ok(!midFlight.realBubble, '落定之前真泡泡还没有被创建（影子交接，不是两套并存）');
+
+    // 等落定
+    await waitUntil(cdp, `!document.querySelector('.bubble--shadow')`, 6000);
+    await sleep(120);
+
+    const rippleCount = await evaluate(cdp, `document.querySelectorAll('.ripple').length`);
+    ok(rippleCount >= 1, `落定时出现了涟漪（还有 ${rippleCount} 个在扩散）`);
+
+    const flight = JSON.parse(await evaluate(cdp, `JSON.stringify(window.__nebula.lastFlight())`));
+    const dShadowToTarget = Math.hypot(flight.shadowEnd.x - flight.to.x, flight.shadowEnd.y - flight.to.y);
+    ok(
+      dShadowToTarget < 3,
+      '🔴 影子最终落在算出来的终点上 —— offset-path 的"视口绝对坐标"用对了',
+      `偏差 ${dShadowToTarget.toFixed(2)}px（若坐标系写错，这里会差几百像素）`,
+    );
+
+    // 控制点确实在中点上方（弧线而不是直线）
+    const midY = (flight.from.y + flight.to.y) / 2;
+    ok(flight.control.y < midY - 10, `弧线确实向上兜（控制点比中点高 ${(midY - flight.control.y).toFixed(0)}px）`);
+
+    const landed = await evaluate(
+      cdp,
+      `(() => {
+        const el = Array.from(document.querySelectorAll('.bubble--idea:not(.bubble--shadow)'))
+          .find(e => e.querySelector('.bubble-label').textContent === ${JSON.stringify(FLY_TEXT)});
+        return el ? true : null;
+      })()`,
+    );
+    ok(landed === true, '落定后真泡泡已经出现');
+
+    // 🔴 用"创建那一刻"记录的位置比，而不是现在的位置 ——
+    //    力场在落定后立刻开始推它，晚测 100ms 就已经偏了十几像素
+    ok(flight.landedAt !== null, '记录了真泡泡诞生的那一刻位置');
+    const dHandoff = flight.landedAt
+      ? Math.hypot(flight.landedAt.x - flight.shadowEnd.x, flight.landedAt.y - flight.shadowEnd.y)
+      : 999;
+    ok(
+      dHandoff < 2,
+      '影子落点与真泡泡的诞生位置重合（交接不跳）',
+      `偏差 ${dHandoff.toFixed(2)}px`,
+    );
+
+    console.log('\n── 悬停微胀大（阶段 4） ──');
+
+    await evaluate(cdp, `window.__nebula.fitAll()`);
+    // 先把鼠标移开，确保不是悬停态
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 8, y: 8 });
+    await sleep(250);
+
+    const hoverTargetSel = await evaluate(
+      cdp,
+      `(() => {
+        const stage = document.querySelector('#stage').getBoundingClientRect();
+        const el = Array.from(document.querySelectorAll('.bubble--idea:not(.bubble--shadow)')).find((e) => {
+          const r = e.getBoundingClientRect();
+          return r.left >= stage.left + 6 && r.top >= stage.top + 6 &&
+                 r.right <= stage.right - 6 && r.bottom <= stage.bottom - 6;
+        });
+        return el ? '.bubble[data-id="' + el.dataset.id + '"]' : null;
+      })()`,
+    );
+    ok(typeof hoverTargetSel === 'string', '找到一个可以做悬停测试的泡泡', String(hoverTargetSel));
+
+    const idle = await evaluate(
+      cdp,
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(hoverTargetSel)});
+        return {
+          scale: getComputedStyle(el.querySelector('.bubble-scale')).transform,
+          labelOpacity: getComputedStyle(el.querySelector('.bubble-label')).opacity,
+          labelShadow: getComputedStyle(el.querySelector('.bubble-label')).textShadow,
+        };
+      })()`,
+    );
+    ok(
+      idle.scale === 'none' || idle.scale === 'matrix(1, 0, 0, 1, 0, 0)',
+      '未悬停时没有缩放',
+      idle.scale,
+    );
+    ok(Number(idle.labelOpacity) < 1, `未悬停时文字是"柔"的（opacity ${idle.labelOpacity}）`);
+    ok(
+      idle.labelShadow !== 'none',
+      '柔化用 text-shadow 实现，而不是 filter: blur()（几百个元素上 blur 会掉到个位数 fps）',
+      idle.labelShadow,
+    );
+
+    const hoverPoint = await centerOf(cdp, hoverTargetSel);
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: hoverPoint.x, y: hoverPoint.y });
+    await sleep(280);
+
+    const hovered = await evaluate(
+      cdp,
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(hoverTargetSel)});
+        return {
+          scale: getComputedStyle(el.querySelector('.bubble-scale')).transform,
+          labelOpacity: getComputedStyle(el.querySelector('.bubble-label')).opacity,
+          labelShadow: getComputedStyle(el.querySelector('.bubble-label')).textShadow,
+        };
+      })()`,
+    );
+    const hoverScale = Number((hovered.scale.match(/matrix\(([\d.]+)/) ?? [])[1]);
+    ok(hoverScale > 1.03 && hoverScale < 1.05, `悬停时放大到 1.04（实测 ${hoverScale}）`, hovered.scale);
+    ok(Number(hovered.labelOpacity) === 1, `悬停时文字变清晰（opacity ${hovered.labelOpacity}）`);
+    ok(hovered.labelShadow === 'none', '悬停时去掉了柔化', hovered.labelShadow);
+
+    console.log('\n── 放大到中央（阶段 4） ──');
+
+    await evaluate(cdp, `window.__nebula.fitAll()`);
+    await sleep(250);
+
+    const zoomTargetId = await evaluate(
+      cdp,
+      `(() => {
+        const stage = document.querySelector('#stage').getBoundingClientRect();
+        const el = Array.from(document.querySelectorAll('.bubble--idea:not(.bubble--shadow)')).find((e) => {
+          const r = e.getBoundingClientRect();
+          return r.left >= stage.left + 6 && r.top >= stage.top + 6 &&
+                 r.right <= stage.right - 6 && r.bottom <= stage.bottom - 6;
+        });
+        return el ? el.dataset.id : null;
+      })()`,
+    );
+    const zoomSel = `.bubble[data-id="${zoomTargetId}"]`;
+    const zoomPoint = await centerOf(cdp, zoomSel);
+
+    // 真实单击（不是 .click() —— 命中测试那节已经证明这条路是通的）
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: zoomPoint.x,
+      y: zoomPoint.y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: zoomPoint.x,
+      y: zoomPoint.y,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+    await sleep(520);
+
+    ok(await evaluate(cdp, `window.__nebula.isZoomed()`), '单击泡泡 → 放大态打开');
+
+    const zoomView = await evaluate(
+      cdp,
+      `(() => {
+        const clone = document.querySelector('.bubble--zoom');
+        if (!clone) return null;
+        const r = clone.getBoundingClientRect();
+        const src = document.querySelector(${JSON.stringify(zoomSel)});
+        const rec = window.__nebula.lastZoom();
+        return {
+          w: r.width, h: r.height,
+          cx: r.left + r.width / 2, cy: r.top + r.height / 2,
+          vw: innerWidth, vh: innerHeight,
+          srcHidden: src.classList.contains('bubble--hidden'),
+          recSrcAspect: rec.src.w / rec.src.h,
+          recTargetAspect: rec.target.w / rec.target.h,
+          shape: rec.shape,
+          scale: rec.scale,
+          backdrop: !!document.querySelector('.zoom-backdrop'),
+        };
+      })()`,
+    );
+    ok(zoomView !== null, '放大态的克隆体已经出现');
+    ok(zoomView?.backdrop, '放大时底层有遮罩（点它可以收回）');
+    ok(zoomView?.srcHidden, '原泡泡被暂时隐藏（收回时会原地复活）');
+
+    const dCenter = Math.hypot(zoomView.cx - zoomView.vw / 2, zoomView.cy - zoomView.vh / 2);
+    ok(dCenter < 3, `放大后居中于屏幕（偏离中心 ${dCenter.toFixed(1)}px）`);
+
+    // 🔴 形状不歪的判据：目标框与源框长宽比一致
+    ok(
+      Math.abs(zoomView.recTargetAspect - zoomView.recSrcAspect) < 1e-9,
+      '🔴 目标框与源框长宽比完全一致 ⇒ 等比缩放不会把形状拉歪',
+      `${zoomView.recSrcAspect.toFixed(4)} vs ${zoomView.recTargetAspect.toFixed(4)}`,
+    );
+    ok(
+      Math.abs(zoomView.w / zoomView.h - zoomView.recSrcAspect) < 0.02,
+      'DOM 里克隆体的实测长宽比也与源一致（不只是纸面计算）',
+      `${(zoomView.w / zoomView.h).toFixed(4)}`,
+    );
+    ok(zoomView.scale >= 1 && zoomView.scale <= 3.4, `放大倍数在合理区间（${zoomView.scale.toFixed(2)}）`);
+
+    // 🔴 字号公式的最终检验：真实排版下文字必须既没横向溢出、也没纵向被截断。
+    //    单元测试用的是"每行字数 ≈ 框宽 / 字号"的一阶模型，只有这里能验真实换行。
+    const fitCheck = async (label) => {
+      const info = await evaluate(
+        cdp,
+        `(() => {
+          const clone = document.querySelector('.bubble--zoom');
+          if (!clone) return null;
+          const inner = clone.querySelector('.bubble-inner');
+          const lab = clone.querySelector('.bubble-label');
+          const fs = parseFloat(getComputedStyle(lab).fontSize);
+          return {
+            font: +fs.toFixed(1),
+            innerW: inner.clientWidth, innerH: inner.clientHeight,
+            labelW: lab.scrollWidth, labelH: lab.scrollHeight,
+            lines: Math.round(lab.scrollHeight / (fs * 1.45)),
+            chars: lab.textContent.length,
+          };
+        })()`,
+      );
+      ok(
+        info !== null && info.labelW <= info.innerW + 1,
+        `${label}：放大态文字没有横向溢出`,
+        JSON.stringify(info),
+      );
+      ok(
+        info !== null && info.labelH <= info.innerH + 1,
+        `${label}：放大态文字没有纵向被截断`,
+        JSON.stringify(info),
+      );
+      return info;
+    };
+
+    await fitCheck('当前这条（短文本）');
+
+    // 再验一条长文本（卡片档）—— 最容易塞不下的就是它
+    const closeZoomAndOpenLong = async () => {
+      for (const type of ['keyDown', 'keyUp']) {
+        await cdp.send('Input.dispatchKeyEvent', {
+          type,
+          key: 'Escape',
+          code: 'Escape',
+          windowsVirtualKeyCode: 27,
+        });
+      }
+      await sleep(400);
+
+      const longCenter = await evaluate(
+        cdp,
+        `(() => {
+          const el = Array.from(document.querySelectorAll('.bubble--idea:not(.bubble--shadow)'))
+            .sort((a, b) => b.querySelector('.bubble-label').textContent.length
+                          - a.querySelector('.bubble-label').textContent.length)[0];
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        })()`,
+      );
+      if (!longCenter) return false;
+
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await cdp.send('Input.dispatchMouseEvent', {
+          type,
+          x: longCenter.x,
+          y: longCenter.y,
+          button: 'left',
+          buttons: type === 'mousePressed' ? 1 : 0,
+          clickCount: 1,
+        });
+      }
+      await sleep(600);
+      return await evaluate(cdp, `window.__nebula.isZoomed()`);
+    };
+
+    if (await closeZoomAndOpenLong()) {
+      const longPlan = JSON.parse(await evaluate(cdp, `JSON.stringify(window.__nebula.lastZoom())`));
+      ok(longPlan.shape === 'card' || longPlan.shape === 'circle', `长文本的档位：${longPlan.shape}`);
+      await fitCheck('最长的那条（卡片档）');
+      for (const type of ['keyDown', 'keyUp']) {
+        await cdp.send('Input.dispatchKeyEvent', {
+          type,
+          key: 'Escape',
+          code: 'Escape',
+          windowsVirtualKeyCode: 27,
+        });
+      }
+      await sleep(400);
+    } else {
+      ok(false, '能打开最长那条的放大态');
+    }
+
+    // 为后面的"三次收回"测试重新打开一次
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type,
+        x: zoomPoint.x,
+        y: zoomPoint.y,
+        button: 'left',
+        buttons: type === 'mousePressed' ? 1 : 0,
+        clickCount: 1,
+      });
+    }
+    await sleep(600);
+
+    // 收回方式 1：按 Esc
+    for (const type of ['keyDown', 'keyUp']) {
+      await cdp.send('Input.dispatchKeyEvent', {
+        type,
+        key: 'Escape',
+        code: 'Escape',
+        windowsVirtualKeyCode: 27,
+      });
+    }
+    await sleep(400);
+    ok(!(await evaluate(cdp, `window.__nebula.isZoomed()`)), '按 Esc 收回');
+    ok(
+      !(await evaluate(cdp, `document.querySelector(${JSON.stringify(zoomSel)}).classList.contains('bubble--hidden')`)),
+      '收回后原泡泡重新出现',
+    );
+
+    // 收回方式 2：点空白（遮罩）
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: zoomPoint.x,
+      y: zoomPoint.y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: zoomPoint.x,
+      y: zoomPoint.y,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+    await sleep(520);
+    ok(await evaluate(cdp, `window.__nebula.isZoomed()`), '再次单击 → 又放大');
+
+    const backdropAt = await evaluate(
+      cdp,
+      `(() => {
+        const b = document.querySelector('.zoom-backdrop');
+        const r = b.getBoundingClientRect();
+        return { x: r.left + 12, y: r.top + 12 };
+      })()`,
+    );
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: backdropAt.x,
+      y: backdropAt.y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: backdropAt.x,
+      y: backdropAt.y,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+    await sleep(400);
+    ok(!(await evaluate(cdp, `window.__nebula.isZoomed()`)), '点空白（遮罩）收回');
+
+    // 收回方式 3：再点放大后的泡泡
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: zoomPoint.x,
+      y: zoomPoint.y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: zoomPoint.x,
+      y: zoomPoint.y,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+    await sleep(520);
+    ok(await evaluate(cdp, `window.__nebula.isZoomed()`), '第三次单击 → 放大');
+
+    const cloneCenter = await evaluate(
+      cdp,
+      `(() => { const r = document.querySelector('.bubble--zoom').getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`,
+    );
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: cloneCenter.x,
+      y: cloneCenter.y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: cloneCenter.x,
+      y: cloneCenter.y,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+    await sleep(400);
+    ok(!(await evaluate(cdp, `window.__nebula.isZoomed()`)), '再点放大后的泡泡也能收回');
 
     console.log('\n── 页面内自检 ──');
 

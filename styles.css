@@ -92,12 +92,26 @@ body {
 .bubble-scale {
   width: 100%;
   height: 100%;
-  /* 悬停缩放走这一层；transition 只声明 transform，开销最低 */
+  /* 悬停缩放走这一层；transition 只声明 transform，开销最低。
+     落定"啵"的 WAAPI 动画也打在这一层 —— 它不加 fill，所以动画一结束
+     就自然回到这里的值，hover 立刻生效。 */
   transition: transform 140ms ease-out;
 }
 
-.bubble:hover .bubble-scale {
+/* 🔴 拖拽中的泡泡不能有 hover 效果，否则会"一边拖一边胀大" */
+.bubble:not(.bubble--dragging):hover .bubble-scale {
   transform: scale(1.04);
+}
+
+.bubble--dragging {
+  cursor: grabbing;
+  z-index: 5;
+}
+
+/* 放大到中央期间，真泡泡暂时让位给克隆体 */
+.bubble--hidden {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .bubble-inner {
@@ -126,6 +140,25 @@ body {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: var(--lines, 3);
   overflow: hidden;
+}
+
+/*
+ * 平时字是"柔"的，悬停时才变清晰。
+ *
+ * 🔴 "变清晰"**绝不能用 `filter: blur()`** —— 给几百个泡泡各挂一个 filter，
+ *    每个都要单独合成一层并跑一次高斯模糊，实测会直接掉到个位数 fps，
+ *    手机上更严重。这里用一个 0.5px 的 text-shadow 模拟同样的柔化观感，
+ *    开销低一两个数量级；悬停时把它去掉 + opacity 提到 1，视觉上就是"聚焦"。
+ */
+.bubble--idea .bubble-label {
+  opacity: 0.78;
+  text-shadow: 0 0 0.5px currentColor;
+  transition: opacity 140ms ease-out;
+}
+
+.bubble--idea:not(.bubble--dragging):hover .bubble-label {
+  opacity: 1;
+  text-shadow: none;
 }
 
 .bubble-label--single {
@@ -177,21 +210,84 @@ body {
   font-size: 14px;
 }
 
-/* 入场：只动 transform + opacity。动画结束后由 JS 摘掉这个类，
-   否则 animation 的最终值会压住 hover 的 scale。 */
-.is-entering {
-  animation: bubble-in 240ms cubic-bezier(0.2, 0.9, 0.3, 1.15) both;
+/* ── 飞入用的固定图层（影子泡泡 + 涟漪）──────────────────
+ *
+ * 挂在 body 下、position: fixed —— 它在 #world 之外，所以不受视口
+ * translate/scale 的二次变换影响。这是"影子交接"能对齐的前提。
+ * pointer-events: none 保证它永远不吃鼠标事件。
+ */
+
+.fx-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  overflow: hidden;
 }
 
-@keyframes bubble-in {
-  from {
-    transform: scale(0.6);
-    opacity: 0;
-  }
-  to {
-    transform: scale(1);
-    opacity: 1;
-  }
+.bubble--shadow {
+  position: fixed;
+  /* 🔴 offset-path 的 path() 坐标是**视口绝对坐标**，只有配合 left/top: 0
+     才成立。写成相对定位（比如负 margin 居中）整条弧线会整体偏掉。 */
+  left: 0;
+  top: 0;
+  /* 不让泡泡沿路径旋转 */
+  offset-rotate: 0deg;
+  /* 用元素中心对齐路径点，于是"影子中心落在哪"就等于"泡泡落在哪" */
+  offset-anchor: center;
+  pointer-events: none;
+}
+
+.ripple {
+  position: fixed;
+  width: 26px;
+  height: 26px;
+  margin-left: -13px;
+  margin-top: -13px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent);
+  background: var(--accent-soft);
+  /* 起始透明度由 keyframes 给；动画不加 fill，结束后自然回到这里被移除 */
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ── 放大到中央 ─────────────────────────────────────────── */
+
+.zoom-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+/* 🔴 同 .layer 那个坑：作者样式的 display 会压过 UA 的 [hidden]{display:none} */
+.zoom-layer[hidden] {
+  display: none;
+}
+
+.zoom-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(44, 44, 42, 0.34);
+  opacity: 0;
+}
+
+.zoom-layer--visible .zoom-backdrop {
+  opacity: 1;
+  transition: opacity 200ms ease-out;
+}
+
+/* 放大态的克隆体：尺寸/位置/transform-origin 全由 JS 按 FLIP 算好写进来 */
+.bubble--zoom {
+  position: fixed;
+  cursor: pointer;
+}
+
+/* 放大态要清楚，不要"柔化" */
+.bubble--zoom .bubble-label {
+  opacity: 1;
+  text-shadow: none;
+  transition: none;
 }
 
 /* ── 浮层（空间切换 / 回收站）──────────────────────────── */

@@ -39,6 +39,24 @@ const LINE_HEIGHT_RATIO = 1.45;
 export const MIN_RADIUS = 26;
 export const MAX_RADIUS = 78;
 
+/**
+ * 形状分档阈值：≤ 这个字数的单行文本用**正圆**，超过用**椭圆**。
+ *
+ * 🔴 这个常量同时被阶段 4 的"放大到中央"使用：放大态的形状必须和源泡泡**同一档**，
+ *    否则等比缩放会把圆拉成椭圆、把椭圆压成圆，看着就是"歪了"。
+ *    所以两处共用一个常量，不要各写各的。
+ */
+export const CIRCLE_MAX_CHARS = 8;
+
+/** 泡泡的形状分档。 */
+export type BubbleShape = 'circle' | 'card';
+
+/** 判定一段文本该用圆还是"卡片"（宽椭圆）。纯函数，放大与渲染共用。 */
+export function shapeOf(text: string): BubbleShape {
+  const flat = text.replace(/\n/g, '');
+  return flat.length <= CIRCLE_MAX_CHARS ? 'circle' : 'card';
+}
+
 /** 椭圆内文字与边缘的留白。 */
 const PAD_X = 22;
 const PAD_Y = 18;
@@ -149,8 +167,8 @@ export function ellipseFromMeasurement(
     w = h * aspect;
   }
 
-  // 很短的单行文本（≤4 字）强制正圆，视觉上更像"一颗珠子"
-  if (m.lines.length <= 1 && textLength <= 4) {
+  // 短的单行文本强制正圆：既更像"一颗珠子"，也让阶段 4 的等比放大不会把形状拉歪
+  if (m.lines.length <= 1 && textLength <= CIRCLE_MAX_CHARS) {
     const r = clampNumber(Math.max(w, h), minR, maxR);
     return { rx: r, ry: r };
   }
