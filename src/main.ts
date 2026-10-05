@@ -31,6 +31,17 @@ import { flyIn, getLastFlight, playPop } from './render/flyIn';
 import { getLastZoom, openZoom, type ZoomHandle } from './render/zoom';
 import { makeRng, newId } from './rng';
 import { NebulaStore } from './store';
+import { GitHubClient } from './sync/github';
+import type { MergeReport, SyncDoc } from './sync/merge';
+import { DOC_VERSION } from './sync/merge';
+import {
+  forgetSettings,
+  hasStoredSettings,
+  loadStoredSettings,
+  saveSettings,
+  unlockSettings,
+} from './sync/settings';
+import { SyncEngine, type SyncSnapshot } from './sync/syncEngine';
 import { installFontStackVar, radiusOfCached, scoreMatch } from './text';
 import { mountInput, type NoticeKind } from './ui/input';
 import {
@@ -149,6 +160,11 @@ class App {
   /** 最近一次被"居中"的泡泡 id（自动化测试用）。 */
   private lastCenteredId: string | null = null;
 
+  /** 同步引擎。没有配置远端时是"纯本地"模式。 */
+  private sync: SyncEngine | null = null;
+  private readonly syncBar: HTMLButtonElement;
+  private readonly syncLayer: HTMLElement;
+
   /**
    * 拖拽过、但还没把最终坐标写回数据库的 idea。
    * 值是该位置的"被放下时刻"（写进 movedAt，不是写入时刻 —— 两者差几百毫秒，
@@ -189,6 +205,194 @@ class App {
     this.searchInput = must<HTMLInputElement>('#search');
     this.searchHint = must<HTMLButtonElement>('#search-hint');
     this.bindSearch();
+
+    this.syncBar = must<HTMLButtonElement>('#sync-bar');
+    this.syncLayer = must<HTMLElement>('#sync-layer');
+    this.initSync();
+  }
+
+  // ── 同步：本地是权威，GitHub 是镜像 ────────────────────
+
+  private initSync(): void {
+    this.sync = new SyncEngine({
+      remote: null,
+      readLocal: () => this.readLocalDoc(),
+      writeLocal: (doc) => this.writeLocalDoc(doc),
+      onMerged: (report) => void this.applyMergeFeedback(report),
+      onState: (snap) => this.renderSyncBar(snap),
+      // 别的标签页更新了本地数据：只刷新界面，**不要再同步**（否则两个标签页会来回打）
+      onExternalUpdate: () => void this.refreshCurrentSpace(),
+    });
+
+    this.syncBar.addEventListener('click', () => this.openSyncPanel());
+
+    const layer = this.syncLayer;
+    (layer.querySelector('.layer-backdrop') as HTMLElement).addEventListener('click', () =>
+      this.closeSyncPanel(),
+    );
+    (layer.querySelector('#sync-close') as HTMLButtonElement).addEventListener('click', () =>
+      this.closeSyncPanel(),
+    );
+    (layer.querySelector('#sync-save') as HTMLButtonElement).addEventListener('click', () =>
+      void this.applySyncPanel(),
+    );
+    (layer.querySelector('#sync-now') as HTMLButtonElement).addEventListener('click', () =>
+      void this.sync?.sync({ force: true }),
+    );
+    (layer.querySelector('#sync-forget') as HTMLButtonElement).addEventListener('click', () => {
+      forgetSettings();
+      this.sync?.setRemote(null);
+      this.notice('已清除本机的备份设置（GitHub 上的数据不受影响）', 'info');
+      this.closeSyncPanel();
+    });
+  }
+
+  /** 把本地权威数据读成一份同步文档。 */
+  private async readLocalDoc(): Promise<SyncDoc> {
+    const [spaces, ideas, purged] = await Promise.all([
+      this.store.getAllSpaces(true), // 含回收站里的墓碑
+      this.store.getAllIdeas(),
+      this.store.getPurgedIds(),
+    ]);
+    return { version: DOC_VERSION, savedAt: Date.now(), spaces, ideas, purged };
+  }
+
+  /**
+   * 把合并结果落回本地。
+   *
+   * 🔴 纯 upsert，不做删除：合并是**并集**语义，结果只会比本地多或更新，
+   *    永远不会少。真正"要消失"的东西靠 purged 列表在合并那一步就滤掉了。
+   */
+  private async writeLocalDoc(doc: SyncDoc): Promise<void> {
+    await this.store.putIdeas(doc.ideas);
+    for (const space of doc.spaces) await this.store.putSpace(space);
+    await this.store.setMeta('purgedIds', doc.purged ?? []);
+    this.markSearchDirty();
+  }
+
+  /**
+   * 把合并的差异反馈到界面上。
+   *
+   * 同步必须**可见** —— 用户看不到任何变化时不会相信备份在工作。
+   * 所以：远端带来新东西 → 重建视图 + toast；远端改写了本地 → 那条闪一下。
+   */
+  private async applyMergeFeedback(report: MergeReport): Promise<void> {
+    const touched =
+      report.addedFromRemote.length + report.remoteWon.length + report.addedSpaces.length;
+    if (touched === 0) return;
+
+    // 远端可能改了任意一条（文本 / 位置 / 所属空间），
+    // 最安全的做法是把当前空间的视图整个重建一次（数据已经在库里了）
+    await this.refreshCurrentSpace({ quiet: true });
+
+    for (const id of report.remoteWon) this.flashBubble(id);
+
+    if (report.addedFromRemote.length > 0) {
+      this.notice(`从备份恢复了 ${report.addedFromRemote.length} 条`, 'info');
+    } else if (report.remoteWon.length > 0) {
+      this.notice(`备份更新了 ${report.remoteWon.length} 条`, 'info');
+    }
+  }
+
+  /** 远端赢了本地的泡泡：原地闪一下（scale 1 → 1.08 → 1）。 */
+  private flashBubble(id: string): void {
+    const view = this.views.get(id);
+    if (!view) return;
+    view.scale.animate(
+      [
+        { transform: 'scale(1)', offset: 0 },
+        { transform: 'scale(1.08)', offset: 0.45 },
+        { transform: 'scale(1)', offset: 1 },
+      ],
+      { duration: 240, easing: 'ease-out' },
+    );
+  }
+
+  /** 重新按数据库里的内容渲染当前空间（同步落地后用）。 */
+  private async refreshCurrentSpace(opts: { quiet?: boolean } = {}): Promise<void> {
+    const space = this.current;
+    if (!space) return;
+    const fresh = (await this.store.getAllSpaces()).find((sp) => sp.id === space.id);
+    if (!fresh) return; // 当前空间被远端删掉了 —— 交给下一次打开时处理
+    await this.openSpace(fresh, { keepViewport: true, quiet: opts.quiet === true });
+  }
+
+  private renderSyncBar(snap: SyncSnapshot): void {
+    this.syncBar.dataset.status = snap.status;
+    this.syncBar.textContent = snap.detail || '只存在这台设备';
+  }
+
+  private openSyncPanel(): void {
+    const stored = loadStoredSettings();
+    if (stored) {
+      const set = (sel: string, value: string): void => {
+        (this.syncLayer.querySelector(sel) as HTMLInputElement).value = value;
+      };
+      set('#sync-owner', stored.target.owner);
+      set('#sync-repo', stored.target.repo);
+      set('#sync-branch', stored.target.branch);
+    }
+    this.syncLayer.hidden = false;
+    this.syncLayer.classList.add('layer--visible');
+  }
+
+  private closeSyncPanel(): void {
+    this.syncLayer.classList.remove('layer--visible');
+    this.syncLayer.hidden = true;
+  }
+
+  /**
+   * 保存设置并同步。
+   *
+   * 两种用法共用一个按钮：
+   *  · Token 填了 ⇒ 新配置（加密后存本机）
+   *  · Token 空着但本机已有设置 ⇒ 当作"输入口令解锁"（因为密钥不落地，每次会话都要解锁一次）
+   */
+  private async applySyncPanel(): Promise<void> {
+    const val = (sel: string): string =>
+      (this.syncLayer.querySelector(sel) as HTMLInputElement).value.trim();
+
+    const owner = val('#sync-owner');
+    const repo = val('#sync-repo');
+    const branch = val('#sync-branch') || 'main';
+    const token = val('#sync-token');
+    const passphrase = val('#sync-pass');
+
+    if (passphrase.length < 4) {
+      this.notice('口令至少 4 位', 'warn');
+      return;
+    }
+
+    try {
+      let resolvedToken = token;
+      if (token === '') {
+        const unlocked = await unlockSettings(passphrase);
+        if (!unlocked) {
+          this.notice('本机还没有配置，或者口令不对', 'warn');
+          return;
+        }
+        resolvedToken = unlocked.token;
+        const target = unlocked.target;
+        this.attachRemote(target.owner, target.repo, target.branch, resolvedToken);
+      } else {
+        if (owner === '' || repo === '') {
+          this.notice('仓库 owner 和仓库名都要填', 'warn');
+          return;
+        }
+        await saveSettings({ owner, repo, branch }, token, passphrase);
+        this.attachRemote(owner, repo, branch, token);
+      }
+
+      this.closeSyncPanel();
+      this.notice('正在同步…', 'info');
+      await this.sync?.sync({ force: true });
+    } catch (err) {
+      this.notice(err instanceof Error ? err.message : String(err), 'error');
+    }
+  }
+
+  private attachRemote(owner: string, repo: string, branch: string, token: string): void {
+    this.sync?.setRemote(new GitHubClient({ owner, repo, branch, token }));
   }
 
   // ── 搜索：聚光，不是清场 ──────────────────────────────
@@ -501,6 +705,7 @@ class App {
   private async savePinned(ideaId: string, pinned: boolean): Promise<void> {
     const idea = await this.store.getIdea(ideaId);
     if (!idea) return;
+    this.sync?.markDirty();
     await this.store.putIdea({
       ...idea,
       pinned: pinned ? 1 : 0,
@@ -517,6 +722,7 @@ class App {
     body.pinned = !body.pinned;
     setPinned(view, body.pinned);
     this.markSearchDirty();
+    this.sync?.markDirty();
 
     this.field.wake(0.35);
     this.startLoop();
@@ -570,9 +776,40 @@ class App {
       onSubmit: (text) => this.addIdea(text),
     });
 
+    // 已经配过备份但本次会话还没解锁：密钥不落地，所以要提示用户再输一次口令
+    if (hasStoredSettings()) {
+      this.renderSyncBar({
+        status: 'idle',
+        detail: '备份已配置 · 点这里输入口令解锁',
+        lastSyncAt: null,
+        lastError: null,
+        dirty: false,
+        lastAdded: 0,
+        lastRemoteWon: 0,
+      });
+    }
+
+    this.bindSyncLifecycle();
     this.expose();
     this.bindSelfTest();
     this.inputEl.focus();
+  }
+
+  /**
+   * 同步时机（对应需求里的那几条）。
+   *
+   * 🔴 启动时**先渲染本地再由引擎去拉** —— 绝不能让界面等同步。
+   *    上面已经把本地数据画完了，这里只是"顺带拉一下"。
+   */
+  private bindSyncLifecycle(): void {
+    // 页面被藏起来 / 关掉之前，把攒着的改动推一次
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'hidden') return;
+      if (this.sync?.snapshot.dirty) void this.sync.sync({ force: true });
+    });
+    window.addEventListener('pagehide', () => {
+      if (this.sync?.snapshot.dirty) void this.sync.sync({ force: true });
+    });
   }
 
   /** 自检按钮：把 store 层的真读写结果打印出来（阶段 1 起就有的验证工具）。 */
@@ -601,7 +838,10 @@ class App {
 
   // ── 打开一个空间 ──────────────────────────────────────
 
-  private async openSpace(space: Space, opts: { ignoreSaved?: boolean } = {}): Promise<void> {
+  private async openSpace(
+    space: Space,
+    opts: { ignoreSaved?: boolean; keepViewport?: boolean; quiet?: boolean } = {},
+  ): Promise<void> {
     // 切空间会重建所有泡泡，放大态的克隆体会指向已销毁的源泡泡 —— 先收掉
     this.closeZoom();
 
@@ -659,17 +899,22 @@ class App {
 
     // 首屏装配：错开一点点播"轻落定"，像星云自己聚拢起来，而不是"啪"地全出现。
     // 总错开量封顶 380ms —— 再长会让人等。
-    if (this.heartView) playPop(this.heartView.scale, true, 0);
-    let order = 1;
-    for (const view of this.views.values()) {
-      playPop(view.scale, true, Math.min(order * 18, 380));
-      order++;
+    // 同步落地后的重建用 quiet = true 跳过动画，否则每 2 小时闪一次很吵。
+    if (!opts.quiet) {
+      if (this.heartView) playPop(this.heartView.scale, true, 0);
+      let order = 1;
+      for (const view of this.views.values()) {
+        playPop(view.scale, true, Math.min(order * 18, 380));
+        order++;
+      }
     }
 
     // 视口：有记住的就恢复；没有就以心泡泡为屏幕中心、1:1 起步
-    const saved = opts.ignoreSaved ? undefined : await this.store.getViewport(space.id);
-    this.viewport = saved ?? this.centeredViewport();
-    this.applyViewport();
+    if (!opts.keepViewport) {
+      const saved = opts.ignoreSaved ? undefined : await this.store.getViewport(space.id);
+      this.viewport = saved ?? this.centeredViewport();
+      this.applyViewport();
+    }
 
     this.field.wake(0.6);
     this.kick();
@@ -964,6 +1209,7 @@ class App {
 
     await this.store.deleteSpaceToTrash(spaceId);
     this.markSearchDirty();
+    this.sync?.markDirty();
     this.spaces = await this.store.getAllSpaces();
 
     if (this.current?.id === spaceId) {
@@ -1041,6 +1287,7 @@ class App {
 
     const body = this.bodyFromIdea(idea);
     this.markSearchDirty();
+    this.sync?.markDirty();
 
     // 刻意**不 await** 飞入：让输入框立刻空出来，用户能马上记下一条。
     // 真泡泡在飞完之后才出现（见 launchFlight）。
@@ -1190,6 +1437,22 @@ class App {
 
       /** 清空搜索（恢复全貌）。 */
       clearSearch: () => this.search?.clear(),
+
+      // ── 同步（自动化测试用）────────────────────────
+      /** 当前的同步状态快照。 */
+      syncState: () => this.sync?.snapshot ?? null,
+      /** 手动跑一轮同步。 */
+      syncNow: (force = true) => this.sync?.sync({ force }),
+      /** 标脏（模拟"本地刚改过"）。 */
+      syncDirty: () => this.sync?.markDirty(),
+      /** 读本地权威数据（测试用来核对）。 */
+      readLocalDoc: () => this.readLocalDoc(),
+      /**
+       * 注入一个"模拟远端"。
+       * 🔴 仅供自动化测试 —— 真实的 GitHub 需要你的 token，测试用内存实现替代，
+       *    这样才能把"会毁数据"的那几条路径真正跑一遍。
+       */
+      installRemote: (store: unknown) => this.sync?.setRemote(store as never),
 
       /** 把待写回的位置立刻落库（测试与关页面前用）。 */
       flushPositions: () => this.flushPositions(true),

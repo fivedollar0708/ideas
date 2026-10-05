@@ -1061,6 +1061,7 @@
   var STORE_META = "meta";
   var STORE_TRASH = "trash";
   var META_LAST_SPACE_ID = "lastSpaceId";
+  var META_PURGED_IDS = "purgedIds";
   var viewportKey = (spaceId) => `viewport:${spaceId}`;
   function nextSpaceName(taken) {
     for (let n = 1; n <= 999; n++) {
@@ -1294,6 +1295,18 @@
     setViewport(spaceId, vp) {
       return this.setMeta(viewportKey(spaceId), vp);
     }
+    /** 已被彻底清理的 id（空间与想法混合）。 */
+    async getPurgedIds() {
+      const list = await this.getMeta(META_PURGED_IDS);
+      return Array.isArray(list) ? list : [];
+    }
+    /** 追加彻底清理记录。**只增不减** —— 这是它可安全合并的前提。 */
+    async addPurgedIds(ids) {
+      if (ids.length === 0) return;
+      const existing = new Set(await this.getPurgedIds());
+      for (const id of ids) existing.add(id);
+      await this.setMeta(META_PURGED_IDS, [...existing].sort());
+    }
     async getLastSpaceId() {
       return this.getMeta(META_LAST_SPACE_ID);
     }
@@ -1444,8 +1457,9 @@
      *    回收站条目、空间记录、以及快照里列出的每一条想法。
      *    所以它只该被 purgeExpired / purgeAllTrash 调用，不要在别的地方直接用。
      */
-    purgeEntries(entries) {
-      return this.write([STORE_TRASH, STORE_SPACES, STORE_IDEAS], (tx) => {
+    async purgeEntries(entries) {
+      const gone = [];
+      await this.write([STORE_TRASH, STORE_SPACES, STORE_IDEAS], (tx) => {
         const trash = tx.objectStore(STORE_TRASH);
         const spaces = tx.objectStore(STORE_SPACES);
         const ideas = tx.objectStore(STORE_IDEAS);
@@ -1453,14 +1467,690 @@
           trash.delete(entry.id);
           if (entry.kind === "space" && entry.space) {
             spaces.delete(entry.space.id);
-            for (const idea of entry.ideas ?? []) ideas.delete(idea.id);
+            gone.push(entry.space.id);
+            for (const idea of entry.ideas ?? []) {
+              ideas.delete(idea.id);
+              gone.push(idea.id);
+            }
           } else if (entry.kind === "idea" && entry.idea) {
             ideas.delete(entry.idea.id);
+            gone.push(entry.idea.id);
           }
         }
       });
+      await this.addPurgedIds(gone);
     }
   };
+
+  // src/sync/github.ts
+  var B64_CHUNK = 32768;
+  var REQUEST_TIMEOUT_MS = 12e3;
+  async function fetchWithTimeout(url, init = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  function toBase64(text) {
+    const bytes = new TextEncoder().encode(text);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += B64_CHUNK) {
+      const chunk = bytes.subarray(i, i + B64_CHUNK);
+      binary += String.fromCharCode(...chunk);
+    }
+    return btoa(binary);
+  }
+  function fromBase64(b64) {
+    const clean = b64.replace(/\s+/g, "");
+    let binary;
+    try {
+      binary = atob(clean);
+    } catch (err) {
+      throw new SyncError(
+        "content",
+        `base64 \u89E3\u7801\u5931\u8D25\uFF08\u5185\u5BB9\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u635F\u574F\uFF09\uFF1A${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  }
+  var SyncError = class extends Error {
+    constructor(kind, message) {
+      super(message);
+      this.kind = kind;
+      this.name = "SyncError";
+    }
+    kind;
+  };
+  var GitHubClient = class {
+    constructor(opts) {
+      this.opts = opts;
+    }
+    opts;
+    url(path) {
+      const base = `https://api.github.com/repos/${this.opts.owner}/${this.opts.repo}/contents/${path}`;
+      return `${base}?ref=${encodeURIComponent(this.opts.branch)}`;
+    }
+    headers() {
+      return {
+        Authorization: `Bearer ${this.opts.token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+      };
+    }
+    /**
+     * 把 HTTP 响应翻译成 SyncError。
+     * 分类的意义：'auth' 要停下来让用户换 token，'conflict' 要重新合并重试，
+     * 'network' 要稍后再试 —— 三种的处置完全不同。
+     */
+    async fail(res) {
+      let detail = "";
+      try {
+        const body = await res.json();
+        detail = body.message ?? "";
+      } catch {
+      }
+      const status = res.status;
+      if (status === 401) throw new SyncError("auth", `\u51ED\u636E\u65E0\u6548\uFF08401\uFF09\uFF1A${detail}`);
+      if (status === 403) {
+        if (/rate limit|secondary rate/i.test(detail)) {
+          throw new SyncError("ratelimit", `\u88AB GitHub \u9650\u901F\uFF08403\uFF09\uFF1A${detail}`);
+        }
+        throw new SyncError("auth", `\u6CA1\u6709\u6743\u9650\uFF08403\uFF09\uFF1A${detail}`);
+      }
+      if (status === 404) throw new SyncError("notfound", `\u627E\u4E0D\u5230\uFF08404\uFF09\uFF1A${detail}`);
+      if (status === 409) throw new SyncError("conflict", `\u7248\u672C\u51B2\u7A81\uFF08409\uFF09\uFF1A${detail}`);
+      if (status === 422) throw new SyncError("content", `\u8BF7\u6C42\u5185\u5BB9\u4E0D\u5408\u6CD5\uFF08422\uFF09\uFF1A${detail}`);
+      throw new SyncError("unknown", `GitHub \u8FD4\u56DE ${status}\uFF1A${detail}`);
+    }
+    async readFile(path) {
+      let res;
+      try {
+        res = await fetchWithTimeout(this.url(path), { headers: this.headers() });
+      } catch (err) {
+        throw new SyncError("network", `\u8BF7\u6C42\u5931\u8D25\uFF1A${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (res.status === 404) return null;
+      if (!res.ok) await this.fail(res);
+      const data = await res.json();
+      if (typeof data.sha !== "string" || data.sha === "") {
+        throw new SyncError("content", "\u8FDC\u7AEF\u54CD\u5E94\u7F3A\u5C11 sha\uFF0C\u65E0\u6CD5\u5B89\u5168\u5730\u7EE7\u7EED");
+      }
+      if (typeof data.encoding !== "string" || data.encoding !== "base64") {
+        throw new SyncError(
+          "content",
+          `\u8FDC\u7AEF\u6587\u4EF6\u7684 encoding \u662F "${String(data.encoding)}"\uFF08\u9884\u671F base64\uFF09\u3002\u6587\u4EF6\u53EF\u80FD\u8D85\u8FC7\u4E86 1MB \u2014\u2014 \u8BF7\u5148\u4EBA\u5DE5\u5904\u7406\uFF0C\u4E0D\u8981\u7EE7\u7EED\u540C\u6B65\u3002`
+        );
+      }
+      if (typeof data.content !== "string" || data.content === "") {
+        throw new SyncError("content", '\u8FDC\u7AEF\u8FD4\u56DE\u4E86\u7A7A\u5185\u5BB9 \u2014\u2014 \u62D2\u7EDD\u628A\u5B83\u5F53\u4F5C"\u6570\u636E\u4E3A\u7A7A"\u5904\u7406');
+      }
+      const text = fromBase64(data.content);
+      if (text.trim() === "") {
+        throw new SyncError("content", "\u8FDC\u7AEF\u6587\u4EF6\u5185\u5BB9\u4E3A\u7A7A\u5B57\u7B26\u4E32 \u2014\u2014 \u62D2\u7EDD\u7EE7\u7EED");
+      }
+      return { text, sha: data.sha, base64: data.content };
+    }
+    async writeFile(path, text, message, sha) {
+      const body = {
+        message,
+        content: toBase64(text),
+        branch: this.opts.branch,
+        // 🔴 缺 committer / author 会得到 422。GitHub 要求提交里必须有身份
+        committer: { name: this.opts.owner, email: `${this.opts.owner}@users.noreply.github.com` },
+        author: { name: this.opts.owner, email: `${this.opts.owner}@users.noreply.github.com` }
+      };
+      if (sha) body.sha = sha;
+      let res;
+      try {
+        res = await fetchWithTimeout(
+          `https://api.github.com/repos/${this.opts.owner}/${this.opts.repo}/contents/${path}`,
+          {
+            method: "PUT",
+            headers: { ...this.headers(), "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+          }
+        );
+      } catch (err) {
+        throw new SyncError("network", `\u8BF7\u6C42\u5931\u8D25\uFF1A${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!res.ok) await this.fail(res);
+    }
+    /** 读一个文件、取它的文本；不存在返回 null。 */
+    async tryReadText(path) {
+      const file = await this.readFile(path);
+      return file ? { text: file.text, sha: file.sha } : null;
+    }
+  };
+
+  // src/sync/merge.ts
+  var DOC_VERSION = 1;
+  function emptyDoc(now = Date.now()) {
+    return { version: DOC_VERSION, savedAt: now, spaces: [], ideas: [], purged: [] };
+  }
+  function compareIdeaContent(l, r) {
+    if (l.text !== r.text) return l.text > r.text ? 1 : -1;
+    if (l.archived !== r.archived) return l.archived - r.archived;
+    if (l.pinned !== r.pinned) return l.pinned - r.pinned;
+    if (l.linksAlwaysOn !== r.linksAlwaysOn) return l.linksAlwaysOn - r.linksAlwaysOn;
+    if (l.spaceId !== r.spaceId) return l.spaceId > r.spaceId ? 1 : -1;
+    return 0;
+  }
+  function pickByUpdatedAt(l, r) {
+    if (l.updatedAt !== r.updatedAt) return l.updatedAt > r.updatedAt ? l : r;
+    return compareIdeaContent(l, r) >= 0 ? l : r;
+  }
+  function pickByMovedAt(l, r) {
+    if (l.movedAt !== r.movedAt) return l.movedAt > r.movedAt ? l : r;
+    if (l.x !== r.x) return l.x > r.x ? l : r;
+    if (l.y !== r.y) return l.y > r.y ? l : r;
+    return l;
+  }
+  function mergeIdea(l, r) {
+    const textWinner = pickByUpdatedAt(l, r);
+    const posWinner = pickByMovedAt(l, r);
+    return {
+      ...textWinner,
+      x: posWinner.x,
+      y: posWinner.y,
+      movedAt: posWinner.movedAt
+    };
+  }
+  function mergeSpace(l, r) {
+    if (l.updatedAt !== r.updatedAt) return l.updatedAt > r.updatedAt ? l : r;
+    if (l.name !== r.name) return l.name > r.name ? l : r;
+    if (l.hue !== r.hue) return l.hue > r.hue ? l : r;
+    if (l.deleted !== r.deleted) return l.deleted > r.deleted ? l : r;
+    if (l.purgeAt !== r.purgeAt) return l.purgeAt > r.purgeAt ? l : r;
+    return l;
+  }
+  function mergeDocs(local, remote) {
+    const spaces = /* @__PURE__ */ new Map();
+    for (const s of local.spaces) spaces.set(s.id, s);
+    for (const s of remote.spaces) {
+      const mine = spaces.get(s.id);
+      spaces.set(s.id, mine ? mergeSpace(mine, s) : s);
+    }
+    const ideas = /* @__PURE__ */ new Map();
+    for (const i of local.ideas) ideas.set(i.id, i);
+    for (const i of remote.ideas) {
+      const mine = ideas.get(i.id);
+      ideas.set(i.id, mine ? mergeIdea(mine, i) : i);
+    }
+    const purged = /* @__PURE__ */ new Set([...local.purged ?? [], ...remote.purged ?? []]);
+    return {
+      version: DOC_VERSION,
+      savedAt: Math.max(local.savedAt, remote.savedAt),
+      // 排序让结果稳定：同样的输入永远得到字节相同的输出（也就不会产生无意义的 commit）
+      spaces: [...spaces.values()].filter((sp) => !purged.has(sp.id)).sort((a, b) => a.id < b.id ? -1 : 1),
+      ideas: [...ideas.values()].filter((i) => !purged.has(i.id)).sort((a, b) => a.id < b.id ? -1 : 1),
+      purged: [...purged].sort()
+    };
+  }
+  function sameIdea(a, b) {
+    if (!a || !b) return a === b;
+    return a.text === b.text && a.spaceId === b.spaceId && a.updatedAt === b.updatedAt && a.movedAt === b.movedAt && a.x === b.x && a.y === b.y && a.pinned === b.pinned && a.linksAlwaysOn === b.linksAlwaysOn && a.archived === b.archived;
+  }
+  function diffDocs(localBefore, merged) {
+    const before = new Map(localBefore.ideas.map((i) => [i.id, i]));
+    const beforeSpaces = new Set(localBefore.spaces.map((s) => s.id));
+    const report = { addedFromRemote: [], remoteWon: [], localWon: [], addedSpaces: [] };
+    for (const idea of merged.ideas) {
+      const had = before.get(idea.id);
+      if (!had) {
+        report.addedFromRemote.push(idea.id);
+        continue;
+      }
+      if (sameIdea(had, idea)) report.localWon.push(idea.id);
+      else report.remoteWon.push(idea.id);
+    }
+    for (const space of merged.spaces) {
+      if (!beforeSpaces.has(space.id)) report.addedSpaces.push(space.id);
+    }
+    return report;
+  }
+  function isEmptyDoc(doc) {
+    return doc.spaces.length === 0 && doc.ideas.length === 0;
+  }
+  function sameDoc(a, b) {
+    return serializeDoc(a) === serializeDoc(b);
+  }
+  function serializeDoc(doc) {
+    return `${JSON.stringify(
+      {
+        version: doc.version,
+        savedAt: doc.savedAt,
+        spaces: doc.spaces,
+        ideas: doc.ideas,
+        purged: doc.purged ?? []
+      },
+      null,
+      2
+    )}
+`;
+  }
+
+  // src/sync/settings.ts
+  var KEY_SETTINGS = "nebula.sync.settings";
+  var PBKDF2_ITERATIONS = 12e4;
+  function bytesToB64(bytes) {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 32768) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+    }
+    return btoa(binary);
+  }
+  function b64ToBytes(b64) {
+    const binary = atob(b64);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+    return out;
+  }
+  async function deriveKey(passphrase, salt) {
+    const material = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(passphrase),
+      "PBKDF2",
+      false,
+      ["deriveKey"]
+    );
+    return crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+      material,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  }
+  async function encryptToken(token, passphrase) {
+    if (passphrase.length < 4) {
+      throw new Error("\u53E3\u4EE4\u81F3\u5C11 4 \u4F4D \u2014\u2014 \u592A\u77ED\u7684\u8BDD\u52A0\u5BC6\u5F62\u540C\u865A\u8BBE");
+    }
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await deriveKey(passphrase, salt);
+    const cipher = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      new TextEncoder().encode(token)
+    );
+    return { salt: bytesToB64(salt), iv: bytesToB64(iv), cipher: bytesToB64(new Uint8Array(cipher)) };
+  }
+  async function decryptToken(parts, passphrase) {
+    const key = await deriveKey(passphrase, b64ToBytes(parts.salt));
+    try {
+      const plain = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: b64ToBytes(parts.iv) },
+        key,
+        b64ToBytes(parts.cipher)
+      );
+      return new TextDecoder().decode(plain);
+    } catch {
+      throw new Error("\u53E3\u4EE4\u4E0D\u5BF9\uFF08\u6216\u8BBE\u7F6E\u5DF2\u635F\u574F\uFF09\uFF0C\u65E0\u6CD5\u89E3\u51FA token");
+    }
+  }
+  function loadStoredSettings() {
+    const raw = localStorage.getItem(KEY_SETTINGS);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed.version !== 1 || !parsed.target) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+  async function saveSettings(target, token, passphrase) {
+    const parts = await encryptToken(token, passphrase);
+    const stored = { version: 1, target, ...parts };
+    localStorage.setItem(KEY_SETTINGS, JSON.stringify(stored));
+  }
+  async function unlockSettings(passphrase) {
+    const stored = loadStoredSettings();
+    if (!stored) return null;
+    const token = await decryptToken(stored, passphrase);
+    return { target: stored.target, token };
+  }
+  function forgetSettings() {
+    localStorage.removeItem(KEY_SETTINGS);
+  }
+  function hasStoredSettings() {
+    return loadStoredSettings() !== null;
+  }
+
+  // src/sync/syncEngine.ts
+  var DIRTY_DEBOUNCE_MS = 6e4;
+  var PUSH_THROTTLE_MS = 2 * 60 * 6e4;
+  var MAX_CONFLICT_RETRIES = 2;
+  var CONFIG_PATH = "data/sync.config.json";
+  function defaultConfig(now = Date.now()) {
+    return {
+      version: 1,
+      file: "data/ideas.json",
+      backupFile: "data/ideas.backup.json",
+      fallbackToBackup: false,
+      savedAt: now
+    };
+  }
+  var SYNC_KINDS = /* @__PURE__ */ new Set([
+    "auth",
+    "notfound",
+    "conflict",
+    "ratelimit",
+    "network",
+    "content",
+    "unknown"
+  ]);
+  function errorKind(err) {
+    if (err instanceof SyncError) return err.kind;
+    const kind = err?.kind;
+    if (typeof kind === "string" && SYNC_KINDS.has(kind)) return kind;
+    return "unknown";
+  }
+  var LOCK_NAME = "nebula-sync";
+  var CHANNEL_NAME = "nebula-sync";
+  var SyncEngine = class {
+    constructor(deps) {
+      this.deps = deps;
+      if (typeof BroadcastChannel !== "undefined") {
+        this.channel = new BroadcastChannel(CHANNEL_NAME);
+        this.channel.addEventListener("message", (e) => {
+          if (e.data?.type === "local-updated") {
+            this.deps.onExternalUpdate?.();
+          }
+        });
+      }
+      this.emit();
+    }
+    deps;
+    snapshotValue = {
+      status: "local-only",
+      detail: "\u53EA\u5B58\u5728\u8FD9\u53F0\u8BBE\u5907",
+      lastSyncAt: null,
+      lastError: null,
+      dirty: false,
+      lastAdded: 0,
+      lastRemoteWon: 0
+    };
+    lastPushAt = 0;
+    timer = 0;
+    running = false;
+    channel = null;
+    /** 上一次成功写进 backup 的内容，用来避免"内容没变也产生一个 commit"。 */
+    lastBackupBody = null;
+    get snapshot() {
+      return this.snapshotValue;
+    }
+    setRemote(remote) {
+      this.deps = { ...this.deps, remote };
+      if (!remote) {
+        this.patch({ status: "local-only", detail: "\u53EA\u5B58\u5728\u8FD9\u53F0\u8BBE\u5907", dirty: false });
+      } else if (this.snapshotValue.status === "local-only") {
+        this.patch({ status: "idle", detail: "\u7B49\u5F85\u540C\u6B65" });
+      }
+    }
+    /** 标脏：本地有新东西了，稍后自动推。 */
+    markDirty() {
+      this.patch({ dirty: true });
+      window.clearTimeout(this.timer);
+      this.timer = window.setTimeout(() => void this.sync(), DIRTY_DEBOUNCE_MS);
+    }
+    patch(next) {
+      this.snapshotValue = { ...this.snapshotValue, ...next };
+      this.emit();
+    }
+    emit() {
+      this.deps.onState?.(this.snapshotValue);
+    }
+    /** 跑一轮完整的同步。force = true 时绕过节流与 dirty 判断（手动按钮、关页面时用）。 */
+    async sync(opts = {}) {
+      const remote = this.deps.remote;
+      if (!remote) {
+        this.patch({ status: "local-only", detail: "\u53EA\u5B58\u5728\u8FD9\u53F0\u8BBE\u5907" });
+        return;
+      }
+      if (this.running) return;
+      const run = async () => {
+        this.running = true;
+        try {
+          await this.runOnce(remote, opts.force === true);
+        } finally {
+          this.running = false;
+        }
+      };
+      if (typeof navigator !== "undefined" && navigator.locks) {
+        await navigator.locks.request(LOCK_NAME, run);
+      } else {
+        await run();
+      }
+    }
+    async runOnce(remote, force) {
+      this.patch({ status: "pulling", detail: "\u6B63\u5728\u540C\u6B65\u2026", lastError: null });
+      try {
+        let config = defaultConfig();
+        const configFile = await remote.readFile(CONFIG_PATH);
+        if (configFile) {
+          config = parseConfig(configFile);
+        } else {
+          await remote.writeFile(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
+`, "\u521D\u59CB\u5316\u540C\u6B65\u914D\u7F6E");
+        }
+        let remoteDoc;
+        if (config.fallbackToBackup) {
+          const backup = await remote.readFile(config.backupFile);
+          if (!backup) {
+            throw new SyncError("content", "\u914D\u7F6E\u8981\u6C42\u4ECE\u5907\u4EFD\u56DE\u9000\uFF0C\u4F46\u5907\u4EFD\u6587\u4EF6\u4E0D\u5B58\u5728");
+          }
+          remoteDoc = parseDoc(backup.text, "\u5907\u4EFD\u6587\u4EF6");
+          this.patch({ detail: "\u6B63\u5728\u4ECE\u5907\u4EFD\u6062\u590D\u2026" });
+          config = { ...config, fallbackToBackup: false, savedAt: Date.now() };
+          await remote.writeFile(
+            CONFIG_PATH,
+            `${JSON.stringify(config, null, 2)}
+`,
+            "\u56DE\u9000\u5B8C\u6210\uFF0C\u6E05\u9664 fallbackToBackup",
+            configFile?.sha
+          );
+        } else {
+          const file = await remote.readFile(config.file);
+          if (file) {
+            remoteDoc = parseDoc(file.text, "\u8FDC\u7AEF\u6570\u636E");
+          } else {
+            remoteDoc = emptyDoc();
+          }
+        }
+        const localDoc = await this.deps.readLocal();
+        const merged = mergeDocs(localDoc, remoteDoc);
+        if (isEmptyDoc(merged) && !isEmptyDoc(localDoc)) {
+          throw new SyncError(
+            "content",
+            "\u5408\u5E76\u7ED3\u679C\u4E3A\u7A7A\u4F46\u672C\u5730\u6709\u6570\u636E \u2014\u2014 \u5DF2\u62D2\u7EDD\u63A8\u9001\uFF0C\u5E76\u4FDD\u7559\u672C\u5730\u6570\u636E\u4E0D\u52A8"
+          );
+        }
+        const report = diffDocs(localDoc, merged);
+        const changedLocally = report.addedFromRemote.length > 0 || report.remoteWon.length > 0 || report.addedSpaces.length > 0;
+        if (changedLocally) {
+          await this.deps.writeLocal(merged);
+          this.deps.onMerged?.(report, merged, localDoc);
+          this.channel?.postMessage({ type: "local-updated" });
+        }
+        const throttled = !force && Date.now() - this.lastPushAt < PUSH_THROTTLE_MS;
+        const needPush = this.snapshotValue.dirty || changedLocally;
+        if (!needPush) {
+          this.patch({
+            status: changedLocally ? "merged" : "idle",
+            detail: changedLocally ? `\u5DF2\u5408\u5E76 ${report.addedFromRemote.length} \u6761` : "\u5DF2\u662F\u6700\u65B0",
+            lastSyncAt: Date.now(),
+            lastAdded: report.addedFromRemote.length,
+            lastRemoteWon: report.remoteWon.length
+          });
+          return;
+        }
+        if (throttled && !force) {
+          this.patch({
+            status: changedLocally ? "merged" : "idle",
+            detail: `\u5DF2\u5408\u5E76 ${report.addedFromRemote.length} \u6761 \xB7 \u7A0D\u540E\u63A8\u9001`,
+            lastSyncAt: Date.now(),
+            lastAdded: report.addedFromRemote.length,
+            lastRemoteWon: report.remoteWon.length
+          });
+          return;
+        }
+        if (!config.fallbackToBackup && sameDoc(merged, remoteDoc)) {
+          this.lastPushAt = Date.now();
+          this.patch({
+            status: "idle",
+            detail: "\u5DF2\u662F\u6700\u65B0\uFF08\u65E0\u9700\u63A8\u9001\uFF09",
+            lastSyncAt: Date.now(),
+            dirty: false,
+            lastAdded: report.addedFromRemote.length,
+            lastRemoteWon: report.remoteWon.length
+          });
+          return;
+        }
+        this.patch({ status: "pushing", detail: "\u6B63\u5728\u5907\u4EFD\u2026" });
+        await this.writeBackupIfChanged(remote, config, remoteDoc);
+        await this.pushWithRetry(remote, config, localDoc);
+        this.lastPushAt = Date.now();
+        this.patch({
+          status: "idle",
+          detail: `\u5DF2\u5907\u4EFD \xB7 ${(/* @__PURE__ */ new Date()).toLocaleTimeString("zh-CN", { hour12: false })}`,
+          lastSyncAt: Date.now(),
+          dirty: false,
+          lastError: null,
+          lastAdded: report.addedFromRemote.length,
+          lastRemoteWon: report.remoteWon.length
+        });
+      } catch (err) {
+        const kind = errorKind(err);
+        const message = err instanceof Error ? err.message : String(err);
+        this.patch({
+          status: "error",
+          detail: detailFor(kind, message),
+          lastError: message,
+          // 🔴 凭据无效时清理 dirty，避免每次操作都重试一遍必然失败的请求
+          dirty: kind === "auth" ? false : this.snapshotValue.dirty
+        });
+      }
+    }
+    /** 把远端原文存到 backup。内容没变就跳过（否则每次同步都会多一个 commit）。 */
+    async writeBackupIfChanged(remote, config, remoteDoc) {
+      const body = serializeDoc(remoteDoc);
+      if (this.lastBackupBody === body) return;
+      const existing = await remote.readFile(config.backupFile);
+      if (existing && normalizeWhitespace(existing.text) === normalizeWhitespace(body)) {
+        this.lastBackupBody = body;
+        return;
+      }
+      await remote.writeFile(
+        config.backupFile,
+        body,
+        "\u540C\u6B65\u524D\u5907\u4EFD\uFF08\u56DE\u9000\u7528\uFF09",
+        existing?.sha
+      );
+      this.lastBackupBody = body;
+    }
+    /** 推送，遇到 409 就重新拉取 + 重新合并 + 再推。 */
+    async pushWithRetry(remote, config, localSnapshot) {
+      let doc = mergeDocs(localSnapshot, await this.deps.readLocal());
+      for (let attempt = 0; attempt <= MAX_CONFLICT_RETRIES; attempt++) {
+        const current = await remote.readFile(config.file);
+        if (current) {
+          const remoteDoc = parseDoc(current.text, "\u8FDC\u7AEF\u6570\u636E");
+          doc = mergeDocs(doc, remoteDoc);
+          if (sameDoc(doc, remoteDoc)) return;
+        }
+        try {
+          await remote.writeFile(config.file, serializeDoc(doc), `\u540C\u6B65\u60F3\u6CD5\uFF08${doc.ideas.length} \u6761\uFF09`, current?.sha);
+          await this.deps.writeLocal(doc);
+          return;
+        } catch (err) {
+          const kind = errorKind(err);
+          if (kind !== "conflict" || attempt === MAX_CONFLICT_RETRIES) throw err;
+          doc = mergeDocs(doc, await this.deps.readLocal());
+        }
+      }
+    }
+    destroy() {
+      window.clearTimeout(this.timer);
+      this.channel?.close();
+    }
+  };
+  function normalizeWhitespace(s) {
+    return s.replace(/\s+/g, " ").trim();
+  }
+  function detailFor(kind, message) {
+    switch (kind) {
+      case "auth":
+        return "\u5907\u4EFD\u5931\u8D25\uFF1A\u51ED\u636E\u65E0\u6548\u6216\u65E0\u6743\u9650 \xB7 \u70B9\u6B64\u91CD\u65B0\u914D\u7F6E";
+      case "ratelimit":
+        return "\u5907\u4EFD\u5931\u8D25\uFF1AGitHub \u9650\u901F \xB7 \u7A0D\u540E\u81EA\u52A8\u91CD\u8BD5";
+      case "network":
+        return "\u5907\u4EFD\u5931\u8D25\uFF1A\u7F51\u7EDC\u4E0D\u901A \xB7 \u672C\u5730\u6570\u636E\u4E0D\u53D7\u5F71\u54CD";
+      case "content":
+        return "\u5907\u4EFD\u5931\u8D25\uFF1A\u8FDC\u7AEF\u5185\u5BB9\u5F02\u5E38 \xB7 \u5DF2\u505C\u6B62\u540C\u6B65\u4EE5\u4FDD\u62A4\u672C\u5730\u6570\u636E";
+      case "conflict":
+        return "\u5907\u4EFD\u5931\u8D25\uFF1A\u7248\u672C\u51B2\u7A81 \xB7 \u4F1A\u91CD\u8BD5";
+      default:
+        return `\u5907\u4EFD\u5931\u8D25\uFF1A${message}`;
+    }
+  }
+  function parseConfig(file) {
+    let raw;
+    try {
+      raw = JSON.parse(file.text);
+    } catch (err) {
+      throw new SyncError(
+        "content",
+        `sync.config.json \u89E3\u6790\u5931\u8D25\uFF1A${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    if (typeof raw !== "object" || raw === null) {
+      throw new SyncError("content", "sync.config.json \u4E0D\u662F\u5BF9\u8C61");
+    }
+    const cfg = raw;
+    const base = defaultConfig();
+    return {
+      version: typeof cfg.version === "number" ? cfg.version : base.version,
+      file: typeof cfg.file === "string" && cfg.file !== "" ? cfg.file : base.file,
+      backupFile: typeof cfg.backupFile === "string" && cfg.backupFile !== "" ? cfg.backupFile : base.backupFile,
+      // 只有严格等于 true 才回退 —— 写错字符串不会误触发
+      fallbackToBackup: cfg.fallbackToBackup === true,
+      savedAt: typeof cfg.savedAt === "number" ? cfg.savedAt : base.savedAt
+    };
+  }
+  function parseDoc(text, label) {
+    if (text.trim() === "") {
+      throw new SyncError("content", `${label}\u4E3A\u7A7A\u5B57\u7B26\u4E32 \u2014\u2014 \u62D2\u7EDD\u7EE7\u7EED`);
+    }
+    let raw;
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      throw new SyncError(
+        "content",
+        `${label}\u89E3\u6790\u5931\u8D25\uFF08\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u635F\u574F\uFF09\uFF1A${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    if (typeof raw !== "object" || raw === null) {
+      throw new SyncError("content", `${label}\u4E0D\u662F\u5BF9\u8C61`);
+    }
+    const doc = raw;
+    if (!Array.isArray(doc.spaces) || !Array.isArray(doc.ideas)) {
+      throw new SyncError("content", `${label}\u7F3A\u5C11 spaces / ideas \u6570\u7EC4`);
+    }
+    return {
+      version: typeof doc.version === "number" ? doc.version : 1,
+      savedAt: typeof doc.savedAt === "number" ? doc.savedAt : 0,
+      spaces: doc.spaces,
+      ideas: doc.ideas,
+      purged: Array.isArray(doc.purged) ? doc.purged.filter((x) => typeof x === "string") : []
+    };
+  }
 
   // src/ui/input.ts
   function mountInput(options) {
@@ -2118,6 +2808,10 @@
     viewportAnim = 0;
     /** 最近一次被"居中"的泡泡 id（自动化测试用）。 */
     lastCenteredId = null;
+    /** 同步引擎。没有配置远端时是"纯本地"模式。 */
+    sync = null;
+    syncBar;
+    syncLayer;
     /**
      * 拖拽过、但还没把最终坐标写回数据库的 idea。
      * 值是该位置的"被放下时刻"（写进 movedAt，不是写入时刻 —— 两者差几百毫秒，
@@ -2152,6 +2846,173 @@
       this.searchInput = must("#search");
       this.searchHint = must("#search-hint");
       this.bindSearch();
+      this.syncBar = must("#sync-bar");
+      this.syncLayer = must("#sync-layer");
+      this.initSync();
+    }
+    // ── 同步：本地是权威，GitHub 是镜像 ────────────────────
+    initSync() {
+      this.sync = new SyncEngine({
+        remote: null,
+        readLocal: () => this.readLocalDoc(),
+        writeLocal: (doc) => this.writeLocalDoc(doc),
+        onMerged: (report) => void this.applyMergeFeedback(report),
+        onState: (snap) => this.renderSyncBar(snap),
+        // 别的标签页更新了本地数据：只刷新界面，**不要再同步**（否则两个标签页会来回打）
+        onExternalUpdate: () => void this.refreshCurrentSpace()
+      });
+      this.syncBar.addEventListener("click", () => this.openSyncPanel());
+      const layer = this.syncLayer;
+      layer.querySelector(".layer-backdrop").addEventListener(
+        "click",
+        () => this.closeSyncPanel()
+      );
+      layer.querySelector("#sync-close").addEventListener(
+        "click",
+        () => this.closeSyncPanel()
+      );
+      layer.querySelector("#sync-save").addEventListener(
+        "click",
+        () => void this.applySyncPanel()
+      );
+      layer.querySelector("#sync-now").addEventListener(
+        "click",
+        () => void this.sync?.sync({ force: true })
+      );
+      layer.querySelector("#sync-forget").addEventListener("click", () => {
+        forgetSettings();
+        this.sync?.setRemote(null);
+        this.notice("\u5DF2\u6E05\u9664\u672C\u673A\u7684\u5907\u4EFD\u8BBE\u7F6E\uFF08GitHub \u4E0A\u7684\u6570\u636E\u4E0D\u53D7\u5F71\u54CD\uFF09", "info");
+        this.closeSyncPanel();
+      });
+    }
+    /** 把本地权威数据读成一份同步文档。 */
+    async readLocalDoc() {
+      const [spaces, ideas, purged] = await Promise.all([
+        this.store.getAllSpaces(true),
+        // 含回收站里的墓碑
+        this.store.getAllIdeas(),
+        this.store.getPurgedIds()
+      ]);
+      return { version: DOC_VERSION, savedAt: Date.now(), spaces, ideas, purged };
+    }
+    /**
+     * 把合并结果落回本地。
+     *
+     * 🔴 纯 upsert，不做删除：合并是**并集**语义，结果只会比本地多或更新，
+     *    永远不会少。真正"要消失"的东西靠 purged 列表在合并那一步就滤掉了。
+     */
+    async writeLocalDoc(doc) {
+      await this.store.putIdeas(doc.ideas);
+      for (const space of doc.spaces) await this.store.putSpace(space);
+      await this.store.setMeta("purgedIds", doc.purged ?? []);
+      this.markSearchDirty();
+    }
+    /**
+     * 把合并的差异反馈到界面上。
+     *
+     * 同步必须**可见** —— 用户看不到任何变化时不会相信备份在工作。
+     * 所以：远端带来新东西 → 重建视图 + toast；远端改写了本地 → 那条闪一下。
+     */
+    async applyMergeFeedback(report) {
+      const touched = report.addedFromRemote.length + report.remoteWon.length + report.addedSpaces.length;
+      if (touched === 0) return;
+      await this.refreshCurrentSpace({ quiet: true });
+      for (const id of report.remoteWon) this.flashBubble(id);
+      if (report.addedFromRemote.length > 0) {
+        this.notice(`\u4ECE\u5907\u4EFD\u6062\u590D\u4E86 ${report.addedFromRemote.length} \u6761`, "info");
+      } else if (report.remoteWon.length > 0) {
+        this.notice(`\u5907\u4EFD\u66F4\u65B0\u4E86 ${report.remoteWon.length} \u6761`, "info");
+      }
+    }
+    /** 远端赢了本地的泡泡：原地闪一下（scale 1 → 1.08 → 1）。 */
+    flashBubble(id) {
+      const view = this.views.get(id);
+      if (!view) return;
+      view.scale.animate(
+        [
+          { transform: "scale(1)", offset: 0 },
+          { transform: "scale(1.08)", offset: 0.45 },
+          { transform: "scale(1)", offset: 1 }
+        ],
+        { duration: 240, easing: "ease-out" }
+      );
+    }
+    /** 重新按数据库里的内容渲染当前空间（同步落地后用）。 */
+    async refreshCurrentSpace(opts = {}) {
+      const space = this.current;
+      if (!space) return;
+      const fresh = (await this.store.getAllSpaces()).find((sp) => sp.id === space.id);
+      if (!fresh) return;
+      await this.openSpace(fresh, { keepViewport: true, quiet: opts.quiet === true });
+    }
+    renderSyncBar(snap) {
+      this.syncBar.dataset.status = snap.status;
+      this.syncBar.textContent = snap.detail || "\u53EA\u5B58\u5728\u8FD9\u53F0\u8BBE\u5907";
+    }
+    openSyncPanel() {
+      const stored = loadStoredSettings();
+      if (stored) {
+        const set = (sel, value) => {
+          this.syncLayer.querySelector(sel).value = value;
+        };
+        set("#sync-owner", stored.target.owner);
+        set("#sync-repo", stored.target.repo);
+        set("#sync-branch", stored.target.branch);
+      }
+      this.syncLayer.hidden = false;
+      this.syncLayer.classList.add("layer--visible");
+    }
+    closeSyncPanel() {
+      this.syncLayer.classList.remove("layer--visible");
+      this.syncLayer.hidden = true;
+    }
+    /**
+     * 保存设置并同步。
+     *
+     * 两种用法共用一个按钮：
+     *  · Token 填了 ⇒ 新配置（加密后存本机）
+     *  · Token 空着但本机已有设置 ⇒ 当作"输入口令解锁"（因为密钥不落地，每次会话都要解锁一次）
+     */
+    async applySyncPanel() {
+      const val = (sel) => this.syncLayer.querySelector(sel).value.trim();
+      const owner = val("#sync-owner");
+      const repo = val("#sync-repo");
+      const branch = val("#sync-branch") || "main";
+      const token = val("#sync-token");
+      const passphrase = val("#sync-pass");
+      if (passphrase.length < 4) {
+        this.notice("\u53E3\u4EE4\u81F3\u5C11 4 \u4F4D", "warn");
+        return;
+      }
+      try {
+        let resolvedToken = token;
+        if (token === "") {
+          const unlocked = await unlockSettings(passphrase);
+          if (!unlocked) {
+            this.notice("\u672C\u673A\u8FD8\u6CA1\u6709\u914D\u7F6E\uFF0C\u6216\u8005\u53E3\u4EE4\u4E0D\u5BF9", "warn");
+            return;
+          }
+          resolvedToken = unlocked.token;
+          const target = unlocked.target;
+          this.attachRemote(target.owner, target.repo, target.branch, resolvedToken);
+        } else {
+          if (owner === "" || repo === "") {
+            this.notice("\u4ED3\u5E93 owner \u548C\u4ED3\u5E93\u540D\u90FD\u8981\u586B", "warn");
+            return;
+          }
+          await saveSettings({ owner, repo, branch }, token, passphrase);
+          this.attachRemote(owner, repo, branch, token);
+        }
+        this.closeSyncPanel();
+        this.notice("\u6B63\u5728\u540C\u6B65\u2026", "info");
+        await this.sync?.sync({ force: true });
+      } catch (err) {
+        this.notice(err instanceof Error ? err.message : String(err), "error");
+      }
+    }
+    attachRemote(owner, repo, branch, token) {
+      this.sync?.setRemote(new GitHubClient({ owner, repo, branch, token }));
     }
     // ── 搜索：聚光，不是清场 ──────────────────────────────
     bindSearch() {
@@ -2409,6 +3270,7 @@
     async savePinned(ideaId, pinned) {
       const idea = await this.store.getIdea(ideaId);
       if (!idea) return;
+      this.sync?.markDirty();
       await this.store.putIdea({
         ...idea,
         pinned: pinned ? 1 : 0,
@@ -2423,6 +3285,7 @@
       body.pinned = !body.pinned;
       setPinned(view, body.pinned);
       this.markSearchDirty();
+      this.sync?.markDirty();
       this.field.wake(0.35);
       this.startLoop();
       void this.savePinned(body.id, body.pinned);
@@ -2465,9 +3328,36 @@
         onNotice: this.notice,
         onSubmit: (text) => this.addIdea(text)
       });
+      if (hasStoredSettings()) {
+        this.renderSyncBar({
+          status: "idle",
+          detail: "\u5907\u4EFD\u5DF2\u914D\u7F6E \xB7 \u70B9\u8FD9\u91CC\u8F93\u5165\u53E3\u4EE4\u89E3\u9501",
+          lastSyncAt: null,
+          lastError: null,
+          dirty: false,
+          lastAdded: 0,
+          lastRemoteWon: 0
+        });
+      }
+      this.bindSyncLifecycle();
       this.expose();
       this.bindSelfTest();
       this.inputEl.focus();
+    }
+    /**
+     * 同步时机（对应需求里的那几条）。
+     *
+     * 🔴 启动时**先渲染本地再由引擎去拉** —— 绝不能让界面等同步。
+     *    上面已经把本地数据画完了，这里只是"顺带拉一下"。
+     */
+    bindSyncLifecycle() {
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "hidden") return;
+        if (this.sync?.snapshot.dirty) void this.sync.sync({ force: true });
+      });
+      window.addEventListener("pagehide", () => {
+        if (this.sync?.snapshot.dirty) void this.sync.sync({ force: true });
+      });
     }
     /** 自检按钮：把 store 层的真读写结果打印出来（阶段 1 起就有的验证工具）。 */
     bindSelfTest() {
@@ -2533,15 +3423,19 @@
       }
       this.field.setActiveSpace(space.id);
       this.field.setSpaceBodies(space.id, bodies);
-      if (this.heartView) playPop(this.heartView.scale, true, 0);
-      let order = 1;
-      for (const view of this.views.values()) {
-        playPop(view.scale, true, Math.min(order * 18, 380));
-        order++;
+      if (!opts.quiet) {
+        if (this.heartView) playPop(this.heartView.scale, true, 0);
+        let order = 1;
+        for (const view of this.views.values()) {
+          playPop(view.scale, true, Math.min(order * 18, 380));
+          order++;
+        }
       }
-      const saved = opts.ignoreSaved ? void 0 : await this.store.getViewport(space.id);
-      this.viewport = saved ?? this.centeredViewport();
-      this.applyViewport();
+      if (!opts.keepViewport) {
+        const saved = opts.ignoreSaved ? void 0 : await this.store.getViewport(space.id);
+        this.viewport = saved ?? this.centeredViewport();
+        this.applyViewport();
+      }
       this.field.wake(0.6);
       this.kick();
       this.writeAll();
@@ -2783,6 +3677,7 @@
       if (!confirmed) return;
       await this.store.deleteSpaceToTrash(spaceId);
       this.markSearchDirty();
+      this.sync?.markDirty();
       this.spaces = await this.store.getAllSpaces();
       if (this.current?.id === spaceId) {
         await this.openSpace(this.spaces[0], { ignoreSaved: true });
@@ -2842,6 +3737,7 @@
       await this.store.putIdea(idea);
       const body = this.bodyFromIdea(idea);
       this.markSearchDirty();
+      this.sync?.markDirty();
       void this.launchFlight(idea, body, space);
       this.updateStatusLine();
     }
@@ -2950,6 +3846,21 @@
         lastCentered: () => this.lastCenteredId,
         /** 清空搜索（恢复全貌）。 */
         clearSearch: () => this.search?.clear(),
+        // ── 同步（自动化测试用）────────────────────────
+        /** 当前的同步状态快照。 */
+        syncState: () => this.sync?.snapshot ?? null,
+        /** 手动跑一轮同步。 */
+        syncNow: (force = true) => this.sync?.sync({ force }),
+        /** 标脏（模拟"本地刚改过"）。 */
+        syncDirty: () => this.sync?.markDirty(),
+        /** 读本地权威数据（测试用来核对）。 */
+        readLocalDoc: () => this.readLocalDoc(),
+        /**
+         * 注入一个"模拟远端"。
+         * 🔴 仅供自动化测试 —— 真实的 GitHub 需要你的 token，测试用内存实现替代，
+         *    这样才能把"会毁数据"的那几条路径真正跑一遍。
+         */
+        installRemote: (store) => this.sync?.setRemote(store),
         /** 把待写回的位置立刻落库（测试与关页面前用）。 */
         flushPositions: () => this.flushPositions(true),
         /**

@@ -26,6 +26,11 @@ export const STORE_TRASH = 'trash';
 /** meta 表的 key 常量。视口用 `viewport:<spaceId>` 前缀，见 PROJECT-SPEC.md §4.4。 */
 export const META_LAST_SPACE_ID = 'lastSpaceId';
 export const META_SCHEMA_VERSION = 'schemaVersion';
+/**
+ * 已"彻底清理"的 id 列表（只增不减）。
+ * 同步时它会跟着推到镜像，用来堵住"清掉的东西下次同步又冒回来"。
+ */
+export const META_PURGED_IDS = 'purgedIds';
 export const viewportKey = (spaceId: Id): string => `viewport:${spaceId}`;
 
 interface MetaRecord {
@@ -324,6 +329,20 @@ export class NebulaStore {
     return this.setMeta(viewportKey(spaceId), vp);
   }
 
+  /** 已被彻底清理的 id（空间与想法混合）。 */
+  async getPurgedIds(): Promise<Id[]> {
+    const list = await this.getMeta<Id[]>(META_PURGED_IDS);
+    return Array.isArray(list) ? list : [];
+  }
+
+  /** 追加彻底清理记录。**只增不减** —— 这是它可安全合并的前提。 */
+  async addPurgedIds(ids: readonly Id[]): Promise<void> {
+    if (ids.length === 0) return;
+    const existing = new Set(await this.getPurgedIds());
+    for (const id of ids) existing.add(id);
+    await this.setMeta(META_PURGED_IDS, [...existing].sort());
+  }
+
   async getLastSpaceId(): Promise<Id | undefined> {
     return this.getMeta<Id>(META_LAST_SPACE_ID);
   }
@@ -500,8 +519,12 @@ export class NebulaStore {
    *    回收站条目、空间记录、以及快照里列出的每一条想法。
    *    所以它只该被 purgeExpired / purgeAllTrash 调用，不要在别的地方直接用。
    */
-  private purgeEntries(entries: readonly TrashEntry[]): Promise<void> {
-    return this.write([STORE_TRASH, STORE_SPACES, STORE_IDEAS], (tx) => {
+  private async purgeEntries(entries: readonly TrashEntry[]): Promise<void> {
+    // 记下这次真正删掉了哪些 id —— 之后要写进 purged 列表，
+    // 否则它们会在下次同步时从镜像里复活
+    const gone: Id[] = [];
+
+    await this.write([STORE_TRASH, STORE_SPACES, STORE_IDEAS], (tx) => {
       const trash = tx.objectStore(STORE_TRASH);
       const spaces = tx.objectStore(STORE_SPACES);
       const ideas = tx.objectStore(STORE_IDEAS);
@@ -510,11 +533,18 @@ export class NebulaStore {
         trash.delete(entry.id);
         if (entry.kind === 'space' && entry.space) {
           spaces.delete(entry.space.id);
-          for (const idea of entry.ideas ?? []) ideas.delete(idea.id);
+          gone.push(entry.space.id);
+          for (const idea of entry.ideas ?? []) {
+            ideas.delete(idea.id);
+            gone.push(idea.id);
+          }
         } else if (entry.kind === 'idea' && entry.idea) {
           ideas.delete(entry.idea.id);
+          gone.push(entry.idea.id);
         }
       }
     });
+
+    await this.addPurgedIds(gone);
   }
 }

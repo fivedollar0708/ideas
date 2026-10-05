@@ -1417,6 +1417,213 @@ async function main() {
 
     ok(selfTestRan && okCount > 0, `页内自检确实跑起来了（${okCount} 项）`);
     ok(failCount === 0, `页内自检无失败项`, selfTestText.replace(/\n/g, ' | '));
+
+    console.log('\n── 同步演练（模拟远端，不需要真实 token） ──');
+
+    // 装一个内存版"远端"。它把文件持久化到 localStorage，
+    // 于是"删库 + 重载"之后还能拿回同一份远端数据 —— 相当于另一台设备看到的仓库。
+    const installMockRemote = async () => {
+      await evaluate(
+        cdp,
+        `(() => {
+          const KEY = '__mockRepo';
+          const files = new Map(Object.entries(JSON.parse(localStorage.getItem(KEY) || '{}')));
+          let writes = 0;
+          let mode = 'ok';
+          const persist = () => localStorage.setItem(KEY, JSON.stringify(Object.fromEntries(files)));
+          const mkErr = (kind, msg) => Object.assign(new Error(msg), { kind, name: 'SyncError' });
+          const store = {
+            async readFile(path) {
+              if (mode === 'auth') throw mkErr('auth', '凭据无效（401）：Bad credentials');
+              if (mode === 'network') throw mkErr('network', '请求失败：Failed to fetch');
+              const f = files.get(path);
+              if (!f) return null;
+              if (mode === 'garbage' && path.indexOf('backup') < 0 && path.indexOf('ideas.json') >= 0) {
+                return { text: '{这是坏掉的 JSON', sha: f.sha, base64: '' };
+              }
+              return { text: f.text, sha: f.sha, base64: '' };
+            },
+            async writeFile(path, text, message, sha) {
+              if (mode === 'auth') throw mkErr('auth', '凭据无效（401）');
+              if (mode === 'network') throw mkErr('network', '请求失败：Failed to fetch');
+              writes++;
+              files.set(path, { text, sha: 'sha' + writes });
+              persist();
+            },
+          };
+          window.__mock = {
+            store,
+            writes: () => writes,
+            setMode: (m) => { mode = m; },
+            read: (p) => (files.get(p) ? files.get(p).text : null),
+            write: (p, t) => { files.set(p, { text: t, sha: 'manual' + Math.random() }); persist(); },
+            reset: () => { files.clear(); writes = 0; mode = 'ok'; persist(); },
+          };
+          return 'ok';
+        })()`,
+      );
+      await evaluate(cdp, `window.__nebula.installRemote(window.__mock.store)`);
+    };
+
+    await installMockRemote();
+
+    const readLocalNow = async () => await evaluate(cdp, `window.__nebula.readLocalDoc()`);
+    const runSync = async (waitMs = 500) => {
+      await evaluate(cdp, `window.__nebula.syncNow(true)`);
+      await sleep(waitMs);
+    };
+
+    // ── 演练 1：推送 ──
+    const before1 = await readLocalNow();
+    await evaluate(cdp, `window.__nebula.syncDirty()`);
+    await runSync();
+
+    const pushed = await evaluate(cdp, `window.__mock.read('data/ideas.json')`);
+    ok(typeof pushed === 'string' && pushed.length > 0, '演练1：本地数据被推到了远端');
+    const pushedDoc = JSON.parse(pushed);
+    ok(
+      pushedDoc.ideas.length === before1.ideas.length,
+      `演练1：远端收到的条数与本地一致（${pushedDoc.ideas.length}/${before1.ideas.length}）`,
+    );
+    ok(
+      (await evaluate(cdp, `window.__mock.read('data/sync.config.json')`)) !== null,
+      '演练1：sync.config.json 被自动创建（首次同步）',
+    );
+    ok(
+      (await evaluate(cdp, `window.__mock.read('data/ideas.backup.json')`)) !== null,
+      '演练1：推送前先写了 backup（回退的弹药）',
+    );
+    ok(
+      /^\{/.test(await evaluate(cdp, `window.__mock.read('data/ideas.json')`)),
+      '演练1：远端文件是合法 JSON',
+    );
+
+    // ── 演练 9：内容相同 ⇒ 一个字节都不写 ──
+    const writesBefore = await evaluate(cdp, `window.__mock.writes()`);
+    await runSync();
+    const writesAfter = await evaluate(cdp, `window.__mock.writes()`);
+    ok(
+      writesAfter === writesBefore,
+      '演练9：内容没变时完全不发写请求（GitHub 每次 PUT 都会留一个 commit）',
+      `${writesBefore} → ${writesAfter}`,
+    );
+
+    // ── 演练 4：并发合并不丢 ──
+    const spaceId = before1.spaces[0]?.id;
+    const remoteDoc = JSON.parse(await evaluate(cdp, `window.__mock.read('data/ideas.json')`));
+    remoteDoc.ideas.push({
+      id: 'remote-only-1',
+      spaceId,
+      text: '另一台设备加的想法',
+      createdAt: 1,
+      updatedAt: 1,
+      movedAt: 0,
+      x: 30,
+      y: 30,
+      pinned: 0,
+      linksAlwaysOn: 0,
+      archived: 0,
+    });
+    await evaluate(
+      cdp,
+      `window.__mock.write('data/ideas.json', ${JSON.stringify(JSON.stringify(remoteDoc, null, 2))})`,
+    );
+
+    // 本地也加一条（不推）
+    await typeAndEnter(cdp, '这台设备加的想法');
+    const afterLocalAdd = await readLocalNow();
+    await evaluate(cdp, `window.__nebula.syncDirty()`);
+    await runSync(900);
+
+    const merged = JSON.parse(await evaluate(cdp, `window.__mock.read('data/ideas.json')`));
+    const mergedTexts = merged.ideas.map((i) => i.text);
+    ok(mergedTexts.includes('另一台设备加的想法'), '演练4：远端那条还在（没被本地覆盖）');
+    ok(mergedTexts.includes('这台设备加的想法'), '演练4：本地那条也推上去了');
+    ok(
+      afterLocalAdd.ideas.length + 1 <= merged.ideas.length,
+      `演练4：并发合并没有丢任何一条（${merged.ideas.length} 条）`,
+    );
+
+    // ── 演练 6：远端内容坏掉 ⇒ fail loud，本地一条不少 ──
+    await evaluate(cdp, `window.__mock.setMode('garbage')`);
+    const localBeforeBreak = await readLocalNow();
+    await evaluate(cdp, `window.__nebula.syncDirty()`);
+    await runSync(700);
+
+    const stateAfterBreak = await evaluate(cdp, `window.__nebula.syncState()`);
+    ok(stateAfterBreak.status === 'error', `演练6：远端 JSON 坏掉时状态是 error（${stateAfterBreak.detail}）`);
+    const localAfterBreak = await readLocalNow();
+    ok(
+      localAfterBreak.ideas.length === localBeforeBreak.ideas.length,
+      '🔴 演练6：本地数据一条都没少（解析失败绝不能被当成"空数据"）',
+      `${localBeforeBreak.ideas.length} → ${localAfterBreak.ideas.length}`,
+    );
+
+    // 恢复备份：读远端 config、把 fallbackToBackup 置 true、写回去
+    const cfg = JSON.parse(await evaluate(cdp, `window.__mock.read('data/sync.config.json')`));
+    cfg.fallbackToBackup = true;
+    await evaluate(
+      cdp,
+      `window.__mock.write('data/sync.config.json', ${JSON.stringify(JSON.stringify(cfg, null, 2))})`,
+    );
+    await evaluate(cdp, `window.__mock.setMode('ok')`);
+    await runSync(900);
+
+    const recovered = JSON.parse(await evaluate(cdp, `window.__mock.read('data/ideas.json')`));
+    ok(recovered.ideas.length > 0, `演练6：置上 fallbackToBackup 后从备份恢复（${recovered.ideas.length} 条）`);
+    const cfgAfter = JSON.parse(await evaluate(cdp, `window.__mock.read('data/sync.config.json')`));
+    ok(cfgAfter.fallbackToBackup === false, '演练6：回退后 flag 被自动清掉（不需要重新部署代码）');
+
+    // ── 演练 7：凭据无效 ⇒ 停止重试 ──
+    await evaluate(cdp, `window.__mock.setMode('auth')`);
+    await evaluate(cdp, `window.__nebula.syncDirty()`);
+    await runSync(600);
+    const authState = await evaluate(cdp, `window.__nebula.syncState()`);
+    ok(authState.status === 'error' && /凭据/.test(authState.detail), `演练7：凭据无效时明确报错（${authState.detail}）`);
+    ok(authState.dirty === false, '演练7：凭据无效时清掉 dirty（不会无脑反复重试注定失败的请求）');
+
+    // ── 演练 8：离线 ⇒ 录入照常；恢复后能推上去 ──
+    await evaluate(cdp, `window.__mock.setMode('network')`);
+    await typeAndEnter(cdp, '断网时记下的想法');
+    const offlineDoc = await readLocalNow();
+    ok(
+      offlineDoc.ideas.some((i) => i.text === '断网时记下的想法'),
+      '演练8：断网时录入照常成功（本地先成功，网络后同步）',
+    );
+    await evaluate(cdp, `window.__nebula.syncDirty()`);
+    await runSync(600);
+    ok(
+      (await evaluate(cdp, `window.__nebula.syncState()`)).status === 'error',
+      '演练8：离线时同步报错但界面不卡',
+    );
+
+    await evaluate(cdp, `window.__mock.setMode('ok')`);
+    await runSync(900);
+    const afterOnline = JSON.parse(await evaluate(cdp, `window.__mock.read('data/ideas.json')`));
+    ok(
+      afterOnline.ideas.some((i) => i.text === '断网时记下的想法'),
+      '演练8：恢复网络后自动补推成功',
+    );
+
+    // ── 演练 5：灾难恢复（清空本地 + 重载 + 同步）──
+    const expectedCount = afterOnline.ideas.length;
+    await evaluate(cdp, `indexedDB.deleteDatabase('nebula')`);
+    await sleep(400);
+    await cdp.send('Page.reload', { ignoreCache: true });
+    await sleep(500);
+    await waitUntil(cdp, `document.readyState === 'complete' && !!window.__nebula`, 10000);
+    await sleep(400);
+
+    const wipedDoc = await readLocalNow();
+    ok(wipedDoc.ideas.length === 0, `演练5：本地已经清空（${wipedDoc.ideas.length} 条）`);
+
+    await installMockRemote();
+    await runSync(1200);
+    const restoredDoc = await readLocalNow();
+    ok(
+      restoredDoc.ideas.length >= expectedCount,
+      `🔴 演练5：清空本地后从备份完整恢复（${restoredDoc.ideas.length} 条，期望 ≥ ${expectedCount}）`,
+    );
   } finally {
     try {
       cdp?.close();

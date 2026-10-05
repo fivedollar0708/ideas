@@ -691,6 +691,87 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* ── 同步状态条与设置浮层 ───────────────────────────────── */
+
+.sync-bar {
+  display: block;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 3px 4px;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  color: var(--text-faint);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.sync-bar:hover {
+  color: var(--accent);
+}
+
+.sync-bar[data-status="error"] {
+  color: var(--error);
+}
+
+.sync-bar[data-status="pushing"],
+.sync-bar[data-status="pulling"],
+.sync-bar[data-status="merged"] {
+  color: var(--accent);
+}
+
+.sync-warn {
+  margin: 0 0 12px;
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--warn);
+  background: #FAEEDA;
+  border-radius: 10px;
+}
+
+.sync-warn code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.sync-form {
+  display: grid;
+  gap: 8px;
+}
+
+.sync-field {
+  display: grid;
+  grid-template-columns: 84px 1fr;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.sync-field input {
+  padding: 5px 9px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.sync-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.sync-hint {
+  margin: 10px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
 /* ── 通用按钮与自检（自检是阶段 1 起就有的临时工具）──────── */
 
 .btn {

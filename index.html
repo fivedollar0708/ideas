@@ -49,6 +49,39 @@
   </div>
 </div>
 
+<div id="sync-layer" class="layer" hidden>
+  <div class="layer-backdrop"></div>
+  <div class="layer-panel" role="dialog" aria-label="备份设置">
+    <h2 class="layer-title">备份设置</h2>
+    <p class="sync-warn">
+      想法会备份到你的 GitHub 仓库。<strong>仓库必须是私有的</strong> ——
+      公开仓库里的 <code>data/ideas.json</code> 任何人都能看到。
+    </p>
+    <div class="sync-form">
+      <label class="sync-field"><span>仓库 owner</span>
+        <input id="sync-owner" type="text" autocomplete="off" placeholder="fivedollar0708"></label>
+      <label class="sync-field"><span>仓库名</span>
+        <input id="sync-repo" type="text" autocomplete="off" placeholder="nebula-data"></label>
+      <label class="sync-field"><span>分支</span>
+        <input id="sync-branch" type="text" autocomplete="off" placeholder="main"></label>
+      <label class="sync-field"><span>Token</span>
+        <input id="sync-token" type="password" autocomplete="off" placeholder="github_pat_…"></label>
+      <label class="sync-field"><span>本机口令</span>
+        <input id="sync-pass" type="password" autocomplete="off" placeholder="至少 4 位"></label>
+    </div>
+    <p class="sync-hint">
+      口令用来加密 token 后再存到本机，密钥不落地 —— 所以每次重开页面要重新输入。
+      Token 只勾这一个仓库的 Contents 读写权限，🔴 千万不要勾 Workflows。
+    </p>
+    <div class="layer-actions">
+      <button id="sync-save" class="btn" type="button">保存并同步</button>
+      <button id="sync-now" class="btn" type="button">立即同步</button>
+      <button id="sync-forget" class="btn btn--danger" type="button">清除设置</button>
+      <button id="sync-close" class="btn" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+
 <footer class="dock">
   <p class="meta">
     <span id="space-name" class="space-name">…</span>
@@ -65,6 +98,7 @@
       aria-label="搜索想法">
     <span id="search-count" class="search-count" aria-live="polite"></span>
   </div>
+  <button id="sync-bar" class="sync-bar" type="button">只存在这台设备 · 点这里开启备份</button>
   <p id="notice" class="notice" role="status" aria-live="polite"></p>
   <textarea
     id="input"
