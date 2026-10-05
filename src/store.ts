@@ -11,7 +11,9 @@
  *     镜像与 backup 都在 sync 层，本文件完全不知道网络的存在。
  */
 
+import { newId } from './rng';
 import type { Id, Idea, Space, TrashEntry, Viewport } from './types';
+import { SPACE_NAME_DEFAULT, SPACE_RESTORE_SUFFIX, TRASH_RETENTION_MS } from './types';
 
 const DB_NAME = 'nebula';
 const DB_VERSION = 1;
@@ -29,6 +31,51 @@ export const viewportKey = (spaceId: Id): string => `viewport:${spaceId}`;
 interface MetaRecord {
   key: string;
   value: unknown;
+}
+
+// ── 空间命名的纯函数（不需要数据库，可直接单测）────────────────
+
+/** 在已占用的名字里挑一个不冲突的「未命名 N」。 */
+export function nextSpaceName(taken: ReadonlySet<string>): string {
+  for (let n = 1; n <= 999; n++) {
+    const candidate = `${SPACE_NAME_DEFAULT} ${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${SPACE_NAME_DEFAULT} ${Date.now()}`;
+}
+
+/**
+ * 恢复空间时解决命名冲突。
+ * 规则：原名 → 「原名（恢复）」→「原名（恢复 2）」→ …
+ */
+export function uniqueSpaceName(desired: string, taken: ReadonlySet<string>): string {
+  if (!taken.has(desired)) return desired;
+
+  const first = `${desired}${SPACE_RESTORE_SUFFIX}`;
+  if (!taken.has(first)) return first;
+
+  for (let n = 2; n <= 999; n++) {
+    const candidate = `${desired}（恢复 ${n}）`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${desired}（恢复 ${Date.now()}）`;
+}
+
+/**
+ * 挑一个"用得最少"的色板索引。
+ * 目的是让相邻创建的空间颜色不撞脸 —— 随机取色经常连撞三次，看着很乱。
+ */
+export function pickHue(spaces: readonly Space[]): number {
+  const counts = new Array<number>(9).fill(0);
+  for (const s of spaces) {
+    const idx = ((s.hue % 9) + 9) % 9;
+    counts[idx] += 1;
+  }
+  let best = 0;
+  for (let h = 1; h < 9; h++) {
+    if (counts[h] < counts[best]) best = h;
+  }
+  return best;
 }
 
 export class NebulaStore {
@@ -310,6 +357,106 @@ export class NebulaStore {
   }
 
   /**
+   * 删除空间 → 回收站。
+   *
+   * 🔴 采用「墓碑式」而不是把记录搬走：
+   *    空间留在 spaces 表里但标记 deleted=1 + purgeAt，想法也留在 ideas 表里不动。
+   *    同时在 trash 表写一份**完整快照**（空间本体 + 它的全部想法）。
+   *
+   *    为什么两者都要？
+   *    - 墓碑让"恢复"变成一次极轻的翻转，不需要把大量记录搬回来，
+   *      也不会因为搬到一半失败而留下半截数据；
+   *    - 快照是**第二份保险**：万一过期清理逻辑出 bug、或者 ideas 表被误删，
+   *      快照还能把整个空间救回来。删除是唯一不可逆的操作，值得存两份。
+   *
+   *    ⚠️ PROJECT-SPEC.md §5.4 同时写了「从 spaces 表移出」和「标 deleted=1」，
+   *       是自相矛盾的。这里按后者实现，因为墓碑式对"不想错过任何想法"更安全。
+   */
+  async deleteSpaceToTrash(spaceId: Id, now: number = Date.now()): Promise<TrashEntry | null> {
+    const space = await this.getSpace(spaceId);
+    if (!space || space.deleted === 1) return null;
+
+    // 含归档的想法也要带走 —— 归档不等于删除，恢复时它也该回来
+    const ideas = await this.getIdeasBySpace(spaceId, true);
+    const purgeAt = now + TRASH_RETENTION_MS;
+
+    const tombstone: Space = { ...space, deleted: 1, purgeAt, updatedAt: now };
+    const entry: TrashEntry = {
+      id: space.id,
+      kind: 'space',
+      deletedAt: now,
+      purgeAt,
+      space: tombstone,
+      ideas,
+    };
+
+    await this.write([STORE_SPACES, STORE_TRASH], (tx) => {
+      tx.objectStore(STORE_SPACES).put(tombstone);
+      tx.objectStore(STORE_TRASH).put(entry);
+    });
+
+    return entry;
+  }
+
+  /**
+   * 从回收站恢复。名字冲突时自动加「（恢复）」后缀。
+   *
+   * 🔴 恢复时只补回**库里已经不存在**的想法，绝不覆盖现有记录。
+   *    否则"在 A 设备恢复了一个空间"会把它在 B 设备上的改动冲掉。
+   */
+  async restoreFromTrash(trashId: Id, now: number = Date.now()): Promise<Space | null> {
+    const entries = await this.getAllTrash();
+    const entry = entries.find((e) => e.id === trashId && e.kind === 'space');
+    if (!entry?.space) return null;
+
+    const allSpaces = await this.readAll<Space>(STORE_SPACES);
+    const takenNames = new Set(allSpaces.filter((s) => s.deleted === 0).map((s) => s.name));
+    const name = uniqueSpaceName(entry.space.name, takenNames);
+
+    const restored: Space = { ...entry.space, name, deleted: 0, purgeAt: 0, updatedAt: now };
+
+    const existingIds = new Set((await this.readAll<Idea>(STORE_IDEAS)).map((i) => i.id));
+    const missing = (entry.ideas ?? []).filter((i) => !existingIds.has(i.id));
+
+    await this.write([STORE_SPACES, STORE_IDEAS, STORE_TRASH], (tx) => {
+      tx.objectStore(STORE_SPACES).put(restored);
+      const ideas = tx.objectStore(STORE_IDEAS);
+      for (const idea of missing) ideas.put({ ...idea, spaceId: restored.id });
+      tx.objectStore(STORE_TRASH).delete(entry.id);
+    });
+
+    return restored;
+  }
+
+  /** 创建一个新空间。hue 自动挑用得最少的那个。 */
+  async createSpace(now: number = Date.now()): Promise<Space> {
+    const all = await this.readAll<Space>(STORE_SPACES);
+    const taken = new Set(all.filter((s) => s.deleted === 0).map((s) => s.name));
+
+    const space: Space = {
+      id: newId(),
+      name: nextSpaceName(taken),
+      hue: pickHue(all),
+      createdAt: now,
+      updatedAt: now,
+      deleted: 0,
+      purgeAt: 0,
+    };
+
+    await this.putSpace(space);
+    return space;
+  }
+
+  /** 重命名空间。只改名字，不碰其他字段。 */
+  async renameSpace(spaceId: Id, name: string, now: number = Date.now()): Promise<Space | null> {
+    const space = await this.getSpace(spaceId);
+    if (!space) return null;
+    const next: Space = { ...space, name, updatedAt: now };
+    await this.putSpace(next);
+    return next;
+  }
+
+  /**
    * 清理过期回收站条目。**启动时与打开回收站时都要调**，因为启动时用户
    * 可能在别的空间，可能永远不打开回收站。
    *
@@ -319,13 +466,47 @@ export class NebulaStore {
     const all = await this.getAllTrash();
     const expired = all.filter((e) => e.purgeAt > 0 && e.purgeAt <= now);
     if (expired.length === 0) return 0;
+    await this.purgeEntries(expired);
+    return expired.length;
+  }
 
-    await this.write([STORE_TRASH, STORE_SPACES, STORE_IDEAS], (tx) => {
+  /** 清空回收站（用户手动点"清空"）。返回清理掉的条目数。 */
+  async purgeAllTrash(): Promise<number> {
+    const all = await this.getAllTrash();
+    if (all.length === 0) return 0;
+    await this.purgeEntries(all);
+    return all.length;
+  }
+
+  /**
+   * 只清理回收站里的某一条。
+   *
+   * 🔴 存在的理由：自检（diagnostics）必须能"跑完不留痕迹"，但绝不能顺手
+   *    把用户回收站里真实的东西也删了。所以自检用它，而不是 purgeAllTrash。
+   *    任何"清理自己造的数据"的场景都该用它。
+   */
+  async purgeTrashEntry(trashId: Id): Promise<boolean> {
+    const all = await this.getAllTrash();
+    const entry = all.find((e) => e.id === trashId);
+    if (!entry) return false;
+    await this.purgeEntries([entry]);
+    return true;
+  }
+
+  /**
+   * 真正物理删除一批回收站条目。
+   *
+   * ⚠️ 这是全项目**唯一**的不可逆操作。它同时删三处：
+   *    回收站条目、空间记录、以及快照里列出的每一条想法。
+   *    所以它只该被 purgeExpired / purgeAllTrash 调用，不要在别的地方直接用。
+   */
+  private purgeEntries(entries: readonly TrashEntry[]): Promise<void> {
+    return this.write([STORE_TRASH, STORE_SPACES, STORE_IDEAS], (tx) => {
       const trash = tx.objectStore(STORE_TRASH);
       const spaces = tx.objectStore(STORE_SPACES);
       const ideas = tx.objectStore(STORE_IDEAS);
 
-      for (const entry of expired) {
+      for (const entry of entries) {
         trash.delete(entry.id);
         if (entry.kind === 'space' && entry.space) {
           spaces.delete(entry.space.id);
@@ -335,7 +516,5 @@ export class NebulaStore {
         }
       }
     });
-
-    return expired.length;
   }
 }

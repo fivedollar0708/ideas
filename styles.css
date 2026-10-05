@@ -1,13 +1,16 @@
 /*
  * 想法星云 · 样式
  *
- * 阶段 1 只有"输入框 + 清单"，所以这里刻意很朴素 —— 泡泡星云的视觉在阶段 2/3 才登场。
- * 但有一条现在就要立好：
- *
  * 🔴 字体栈不在这里写第二份。--font-stack 由 src/text.ts 的 FONT_STACK 在启动时
- *    注入（installFontStackVar()）。原因见 text.ts 的注释：canvas 测量和 CSS
- *    渲染必须共用同一个字体栈，写两份迟早会漂移，而漂移的表现是"排版偶尔不对"
- *    这种极难排查的问题。这里的 fallback 只是为了首屏不闪烁。
+ *    注入（installFontStackVar()）。原因见 text.ts：canvas 测量和 CSS 渲染必须
+ *    共用同一个字体栈，写两份迟早漂移，而漂移的表现是"排版偶尔不对"这种
+ *    极难排查的问题。下面的 fallback 只是为了首屏不闪烁。
+ *
+ * 🔴 性能四禁（改这个文件时容易无意违反）：
+ *    · 不用 filter: blur() / backdrop-filter（几百个元素上会掉到个位数 fps）
+ *    · 不写常驻 will-change
+ *    · 动画只动 transform / opacity，不改 width/height/left/top
+ *    · 不在几百个元素上加大半径的 box-shadow
  */
 
 :root {
@@ -22,6 +25,7 @@
   --text-faint: #888780;
   --accent: #534AB7;
   --accent-soft: #EEEDFE;
+  --accent-line: #534AB755;
   --warn: #854F0B;
   --error: #A32D2D;
 }
@@ -49,23 +53,361 @@ body {
   overscroll-behavior: none;
 }
 
-/* ── 顶栏 ─────────────────────────────────────── */
+/* ── 星云画布 ───────────────────────────────────────────── */
 
-.bar {
+#stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  cursor: grab;
+  /* 触屏拖空白时应平移画布，不要被浏览器当成页面滚动 */
+  touch-action: none;
+}
+
+#stage:active {
+  cursor: grabbing;
+}
+
+/*
+ * #world 是 0 尺寸的变换容器：只承载 translate + scale，
+ * 泡泡是它的绝对定位子元素，靠 overflow 溢出显示。
+ * 这样"点空白"的 event.target 才会是 #stage 本身。
+ */
+#world {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+}
+
+/* ── 泡泡（三层：位置 / 缩放 / 视觉）────────────────────── */
+
+.bubble {
+  cursor: pointer;
+}
+
+.bubble-scale {
+  width: 100%;
+  height: 100%;
+  /* 悬停缩放走这一层；transition 只声明 transform，开销最低 */
+  transition: transform 140ms ease-out;
+}
+
+.bubble:hover .bubble-scale {
+  transform: scale(1.04);
+}
+
+.bubble-inner {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 50%;
+  text-align: center;
+  /* 长文本兜底：超出椭圆的字直接裁掉，不让它溢出泡泡 */
+  overflow: hidden;
+  /* 高度换行时字距略收，中文短句更紧凑好看 */
+  line-height: 1.45;
+}
+
+.bubble-label {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  /* 行数由 JS 按椭圆高度算出来，写进 --lines（长文本的第二道兜底） */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--lines, 3);
+  overflow: hidden;
+}
+
+.bubble-label--single {
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  display: block;
+}
+
+.bubble-hint {
+  font-size: 10px;
+  color: var(--accent);
+  /* 默认隐形，hover 才浮现 —— 不占视觉重量 */
+  opacity: 0;
+  transition: opacity 140ms ease-out;
+}
+
+.bubble--heart:hover .bubble-hint {
+  opacity: 0.85;
+}
+
+/* 想法泡泡：中性底 + 所属空间的色调描边 */
+.bubble--idea .bubble-inner {
+  background: var(--surface);
+  border: 1px solid var(--accent-line);
+  color: var(--text);
+}
+
+/* 心泡泡：正圆、实色描边、空间主色 */
+.bubble--heart .bubble-inner {
+  background: var(--accent-soft);
+  border: 1.5px solid var(--accent);
+  color: var(--text);
+  font-weight: 500;
+}
+
+.bubble--heart .bubble-label {
+  font-size: 14px;
+}
+
+/* 入场：只动 transform + opacity。动画结束后由 JS 摘掉这个类，
+   否则 animation 的最终值会压住 hover 的 scale。 */
+.is-entering {
+  animation: bubble-in 240ms cubic-bezier(0.2, 0.9, 0.3, 1.15) both;
+}
+
+@keyframes bubble-in {
+  from {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* ── 浮层（空间切换 / 回收站）──────────────────────────── */
+
+.layer {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.layer-backdrop {
+  position: absolute;
+  inset: 0;
+  /* 只用纯色半透明，不用 backdrop-filter（性能四禁） */
+  background: rgba(44, 44, 42, 0.28);
+  opacity: 0;
+  transition: opacity 160ms ease-out;
+}
+
+.layer--visible .layer-backdrop {
+  opacity: 1;
+}
+
+.layer-panel {
+  position: relative;
+  width: min(520px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  opacity: 0;
+  transform: translateY(10px) scale(0.98);
+  transition:
+    opacity 160ms ease-out,
+    transform 160ms cubic-bezier(0.2, 0.9, 0.3, 1.1);
+}
+
+.layer--visible .layer-panel {
+  opacity: 1;
+  transform: none;
+}
+
+.layer-title {
+  margin: 0 0 14px;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.layer-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* ── 空间列表（浮层里的"心泡泡"们）─────────────────────── */
+
+.space-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.space-chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  /* 圆角接近圆形，呼应画面上的心泡泡 */
+  border-radius: 22px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  opacity: 0;
+  transform: translateY(6px) scale(0.94);
+}
+
+.space-chip.is-visible {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity 220ms ease-out var(--delay, 0ms),
+    transform 220ms cubic-bezier(0.2, 0.9, 0.3, 1.15) var(--delay, 0ms);
+}
+
+.space-chip.is-current {
+  border-color: var(--accent);
+  /* 当前空间用实线 + 内描边区分，不靠颜色明度（色盲友好） */
+  box-shadow: inset 0 0 0 2px var(--accent-soft);
+}
+
+.space-chip-main {
+  display: block;
+  padding: 9px 6px 9px 16px;
+  font: inherit;
+  font-weight: 500;
+  color: var(--text);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.space-chip-del {
   flex: none;
+  width: 26px;
+  height: 26px;
+  margin-right: 8px;
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--text-faint);
+  background: none;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  /* 平时不干扰视线，hover 才明确 */
+  opacity: 0.35;
+  transition: opacity 120ms ease-out;
+}
+
+.space-chip:hover .space-chip-del {
+  opacity: 1;
+}
+
+.space-chip-del:hover {
+  color: var(--error);
+  background: rgba(163, 45, 45, 0.08);
+}
+
+.space-chip-del:disabled {
+  opacity: 0.15;
+  cursor: not-allowed;
+}
+
+.space-chip-input {
+  width: 180px;
+  margin: 6px 6px 6px 12px;
+  padding: 4px 8px;
+  font: inherit;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+}
+
+.space-chip-input:focus {
+  outline: none;
+}
+
+/* ── 回收站 ─────────────────────────────────────────────── */
+
+.trash-hint {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.trash-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.trash-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent, var(--border));
+  border-radius: 10px;
+}
+
+.trash-text {
+  min-width: 0;
+}
+
+.trash-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trash-meta {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.trash-empty {
+  margin: 0;
+  padding: 18px 0;
+  text-align: center;
+  color: var(--text-faint);
+}
+
+/* ── 底部栏 ─────────────────────────────────────────────── */
+
+.dock {
+  flex: none;
+  padding: 8px 18px calc(14px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.meta {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px 18px 10px;
-  padding-top: calc(14px + env(safe-area-inset-top, 0px));
+  margin: 0 0 2px;
 }
 
 .space-name {
   font-weight: 500;
-  font-size: 15px;
-  color: var(--text);
-  /* 空间名很长时截断，不要把顶栏撑破 */
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -75,57 +417,6 @@ body {
   flex: none;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
-}
-
-/* ── 清单 ─────────────────────────────────────── */
-
-.stage {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 0 18px;
-}
-
-.list {
-  list-style: none;
-  margin: 0;
-  padding: 0 0 12px;
-}
-
-.list li {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
-  margin-bottom: 6px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  /* 长文本换行，不撑破卡片 */
-  overflow-wrap: anywhere;
-}
-
-.idea-text {
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.idea-meta {
-  flex: none;
-  color: var(--text-faint);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-/* ── 底部输入区 ───────────────────────────────── */
-
-.dock {
-  flex: none;
-  padding: 8px 18px calc(14px + env(safe-area-inset-bottom, 0px));
-  border-top: 1px solid var(--border);
-  background: var(--surface);
 }
 
 .notice {
@@ -155,7 +446,6 @@ body {
   border: 1px solid var(--border);
   border-radius: 12px;
   resize: none;
-  /* 只准纵向滚动，避免出现横向滚动条 */
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -170,18 +460,10 @@ body {
   color: var(--text-faint);
 }
 
-/* ── 自检（阶段 1 专用的临时候车区，阶段 2 会移除）───── */
-
-.devrow {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  margin-top: 8px;
-}
+/* ── 通用按钮与自检（自检是阶段 1 起就有的临时工具）──────── */
 
 .btn {
-  flex: none;
-  padding: 4px 12px;
+  padding: 6px 14px;
   font: inherit;
   font-size: 12px;
   color: var(--text-dim);
@@ -196,6 +478,22 @@ body {
   color: var(--accent);
 }
 
+.btn--small {
+  padding: 4px 12px;
+}
+
+.btn--danger:hover {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.devrow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 8px;
+}
+
 .selftest-out {
   flex: 1 1 auto;
   margin: 0;
@@ -208,10 +506,11 @@ body {
   white-space: pre-wrap;
 }
 
-/* ── 无障碍：尊重系统的"减少动态效果" ───────────── */
+/* ── 无障碍：尊重系统的"减少动态效果" ───────────────────── */
 
 @media (prefers-reduced-motion: reduce) {
-  * {
+  *,
+  .space-chip.is-visible {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }

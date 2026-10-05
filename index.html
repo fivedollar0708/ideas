@@ -11,16 +11,47 @@
 </head>
 <body>
 
-<header class="bar">
-  <span id="space-name" class="space-name">…</span>
-  <span id="space-count" class="space-count">0 条</span>
-</header>
+<!-- 星云画布。点心泡泡进空间浮层；滚轮缩放；拖空白平移；双击空白回全貌 -->
+<div id="stage">
+  <!-- 🔴 #world 是 0 尺寸的变换容器：它只负责承载 translate+scale，
+       泡泡是它的绝对定位子元素，靠 overflow 溢出显示。
+       这样"点空白"的 target 才会是 #stage，不会被子元素挡住。 -->
+  <div id="world"></div>
+</div>
 
-<main class="stage">
-  <ol id="list" class="list" aria-label="想法清单"></ol>
-</main>
+<!-- 空间切换浮层 -->
+<div id="space-layer" class="layer" hidden>
+  <div class="layer-backdrop"></div>
+  <div class="layer-panel" role="dialog" aria-label="切换空间">
+    <h2 class="layer-title">切换空间</h2>
+    <div class="space-list"></div>
+    <div class="layer-actions">
+      <button id="space-create" class="btn" type="button">新建空间</button>
+      <button id="space-trash" class="btn" type="button">回收站</button>
+    </div>
+  </div>
+</div>
+
+<!-- 回收站浮层 -->
+<div id="trash-layer" class="layer" hidden>
+  <div class="layer-backdrop"></div>
+  <div class="layer-panel" role="dialog" aria-label="回收站">
+    <h2 class="layer-title">回收站</h2>
+    <p class="trash-hint">30 天后自动清除。恢复会把空间连同里面所有想法一起带回来。</p>
+    <ul class="trash-list"></ul>
+    <p class="trash-empty" hidden>回收站是空的</p>
+    <div class="layer-actions">
+      <button id="trash-close" class="btn" type="button">关闭</button>
+      <button id="trash-empty-btn" class="btn btn--danger" type="button">清空回收站</button>
+    </div>
+  </div>
+</div>
 
 <footer class="dock">
+  <p class="meta">
+    <span id="space-name" class="space-name">…</span>
+    <span id="space-count" class="space-count">0 条</span>
+  </p>
   <p id="notice" class="notice" role="status" aria-live="polite"></p>
   <textarea
     id="input"

@@ -164,3 +164,33 @@ export const HEART_ORIGIN: Vec = { x: 0, y: 0 };
 /** 视口缩放的上下限。 */
 export const VIEW_SCALE_MIN = 0.25;
 export const VIEW_SCALE_MAX = 3;
+
+// ── 心泡泡的尺寸参数（见 PROJECT-SPEC.md §3.2）──────────────
+
+/**
+ * 心泡泡比"同名字的普通泡泡"大一圈，一眼可辨。
+ * 🔴 它始终是正圆（不走椭圆）：它是整片星云唯一的锚点，正圆才像球心。
+ */
+export const HEART_SCALE = 1.15;
+export const HEART_MIN_RADIUS = 44;
+export const HEART_MAX_RADIUS = 88;
+
+/** 心泡泡只按名字的前 N 个字算尺寸，名字再长也不会把泡泡撑到吃掉半个屏幕。 */
+export const HEART_NAME_MEASURE_MAX = 12;
+
+/**
+ * 恢复空间时，名字冲突自动加的后缀。
+ * 第一次冲突「星际（恢复）」，再冲突「星际（恢复 2）」。
+ */
+export const SPACE_RESTORE_SUFFIX = '（恢复）';
+
+/**
+ * 新泡泡落点的圆环范围。
+ *
+ * 🔴 上限刻意压得比较小（320）：星云是"以心泡泡为锚点去探索"的，不是一屏看全的。
+ *    如果新泡泡散到 400+ 远，在大屏上还看得见，在笔记本的矮窗口里就直接落在视野外，
+ *    违背"不想错过任何想法"。按紧了让力导向自己去铺开，比一开始就撒太远好。
+ */
+export const SPAWN_MIN_RADIUS = 130;
+export const SPAWN_MAX_RADIUS = 320;
+

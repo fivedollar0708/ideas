@@ -7,7 +7,13 @@
  * 刻意这样切分，是为了让最需要回归测试的排版数学不依赖浏览器环境。
  */
 
-import { MAX_TEXT } from './types';
+import {
+  HEART_MAX_RADIUS,
+  HEART_MIN_RADIUS,
+  HEART_NAME_MEASURE_MAX,
+  HEART_SCALE,
+  MAX_TEXT,
+} from './types';
 
 /**
  * 🔴 全项目字体的唯一真相来源。
@@ -261,6 +267,22 @@ export function radiusOf(
   }
 
   return size;
+}
+
+/**
+ * 心泡泡的半径。
+ *
+ * 与普通泡泡的差别：
+ *  - 始终正圆（普通泡泡是椭圆）
+ *  - 名字不换行成卡片，只按前 HEART_NAME_MEASURE_MAX 个字算尺寸
+ *  - 结果夹在 [HEART_MIN_RADIUS, HEART_MAX_RADIUS]，保证又看得见又点得中
+ */
+export function heartRadiusOf(name: string): number {
+  const clipped = name.slice(0, HEART_NAME_MEASURE_MAX);
+  // 宽度上限给一个很大的值 ⇒ 名字永远排成一行，不会因为换行被算高
+  const m = measureWithCap(clipped === '' ? ' ' : clipped, Number.MAX_SAFE_INTEGER);
+  const needed = Math.max(m.w / 2 + PAD_X, m.h / 2 + PAD_Y) * HEART_SCALE;
+  return clampNumber(needed, HEART_MIN_RADIUS, HEART_MAX_RADIUS);
 }
 
 /** 尺寸缓存。同一段文本永远得到同一尺寸，避免每帧重排。 */
