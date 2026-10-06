@@ -17,6 +17,7 @@
 !app.js
 !README.md
 !PROJECT-SPEC.md
+!HANDOFF.md
 !AI-PROMPTS.md
 !SYNC-DRILLS.md
 !build.cmd
@@ -40,8 +41,10 @@
 !test/text.ts
 
 # —— 数据：只放行模板，真实数据文件永不上传 ——
-!data/
-!data/sync.config.json
+# 🔴 数据绝不在站点仓库里 —— 它在每个用户自己的私有仓库 <user>/nebula-data 下。
+# 这几行是刻意的**反向**规则：就算有人在本地建了 data/，也不许提交到公开的站点仓库。
+data/
+data/**
 
 # —— 显式排除：敏感物 + 构建产物 + 依赖 ——
 .env
