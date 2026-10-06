@@ -35,11 +35,12 @@ import { GitHubClient } from './sync/github';
 import type { MergeReport, SyncDoc } from './sync/merge';
 import { DOC_VERSION } from './sync/merge';
 import {
-  forgetSettings,
-  hasStoredSettings,
-  loadStoredSettings,
-  saveSettings,
-  unlockSettings,
+  clearCredential,
+  credentialRecordExists,
+  isCredentialEncrypted,
+  loadCredential,
+  saveCredential,
+  type SyncTarget,
 } from './sync/settings';
 import { SyncEngine, type SyncSnapshot } from './sync/syncEngine';
 import { installFontStackVar, radiusOfCached, scoreMatch } from './text';
@@ -193,6 +194,9 @@ class App {
 
   /** 待处理的单击（等双击判别窗口过去才真正放大）。 */
   private tapTimer = 0;
+  /** 上一次单击的泡泡与时刻 —— 用来识别"同一位置的第二次按下"。 */
+  private lastTapView: BubbleView | null = null;
+  private lastTapAt = 0;
 
   constructor() {
     this.stage = must<HTMLElement>('#stage');
@@ -262,13 +266,61 @@ class App {
     (layer.querySelector('#sync-switch') as HTMLButtonElement).addEventListener('click', () =>
       void this.switchAccount(),
     );
-    (layer.querySelector('#sync-forget') as HTMLButtonElement).addEventListener('click', () => {
-      forgetSettings();
-      this.sync?.setRemote(null);
-      this.sync?.setAccount(null);
-      this.notice('已清除本机的备份设置（GitHub 上的数据不受影响）', 'info');
-      this.closeSyncPanel();
-    });
+    (layer.querySelector('#sync-forget') as HTMLButtonElement).addEventListener('click', () =>
+      void this.logout(),
+    );
+  }
+
+  /**
+   * 启动时自动登录。
+   *
+   * 🔴 调用时机很关键：**上面已经把本地数据渲染完了**，这里只是后台接上远端。
+   *    绝不能出现"等同步完再显示" —— 那样每次打开都要盯着一片空星云。
+   */
+  private async autoLogin(): Promise<void> {
+    const cred = await loadCredential();
+
+    if (!cred) {
+      // 有记录但解不开（换了浏览器配置等）—— 要和"从没登录过"区分开，
+      // 否则当事人会以为自己的数据没了
+      if (await credentialRecordExists()) {
+        this.renderSyncBar(this.syncBarText('登录已失效 · 点这里重新登录'));
+      }
+      return;
+    }
+
+    this.sync?.setAccount(cred.target.owner);
+    this.sync?.setRemote(
+      this.remoteFactory({ token: cred.token, ...cred.target }),
+    );
+    this.renderSyncBar(this.syncBarText(`@${cred.target.owner} · 正在同步…`));
+
+    await this.sync?.sync();
+  }
+
+  /**
+   * 退出登录。
+   *
+   * 🔴 这是唯一"会清空本机数据"的用户操作，所以确认框要按实际情况给不同的话：
+   *    备份过 ⇒ 告诉他数据在 GitHub 上，重新登录能取回；
+   *    从没备份过 ⇒ 明确警告"数据会真的消失"。
+   */
+  private async logout(): Promise<void> {
+    const owner = (await this.store.getOwnerHandle()) ?? '这个账号';
+    const backedUp = this.sync?.snapshot.everPushed === true;
+
+    const ok = window.confirm(
+      backedUp
+        ? `退出登录会清空这台设备上的数据。\n\n` +
+            `@${owner} 的想法在他的 GitHub 备份里，重新登录就能取回。\n\n确定退出？`
+        : `⚠️ 这台设备从来没有成功备份过。\n\n` +
+            `退出登录会清空本机数据，而且没有备份可以恢复 —— 数据会真的消失。\n\n仍然要退出吗？`,
+    );
+    if (!ok) return;
+
+    await clearCredential();
+    await this.store.wipeAllData();
+    location.reload();
   }
 
   /** 把本地权威数据读成一份同步文档。 */
@@ -347,19 +399,22 @@ class App {
   }
 
   private openSyncPanel(): void {
-    const stored = loadStoredSettings();
     const accountEl = this.syncLayer.querySelector('#sync-account') as HTMLElement;
     const switchBtn = this.syncLayer.querySelector('#sync-switch') as HTMLButtonElement;
 
-    void this.store.getOwnerHandle().then((localOwner) => {
-      if (stored) {
-        accountEl.textContent = `已连接：@${stored.target.owner}/${stored.target.repo}（${stored.target.branch}）`;
-      } else {
-        accountEl.textContent = '';
-      }
-      // 账号不匹配时把"切换"按钮亮出来，并说明为什么停了
-      switchBtn.hidden = !(localOwner && stored && localOwner !== stored.target.owner);
-    });
+    void Promise.all([loadCredential(), this.store.getOwnerHandle()]).then(
+      ([cred, localOwner]) => {
+        if (cred) {
+          accountEl.textContent =
+            `已登录：@${cred.target.owner}/${cred.target.repo}（${cred.target.branch}）` +
+            (isCredentialEncrypted() ? '' : ' · ⚠️ 当前不是 HTTPS，token 只能明文保存');
+        } else {
+          accountEl.textContent = '';
+        }
+        // 账号不匹配时把"切换"按钮亮出来，并说明为什么停了
+        switchBtn.hidden = !(localOwner && cred && localOwner !== cred.target.owner);
+      },
+    );
 
     this.syncLayer.hidden = false;
     this.syncLayer.classList.add('layer--visible');
@@ -379,42 +434,28 @@ class App {
    * 这就是"零服务端的 GitHub 登录"能到达的最好体验。
    */
   private async applySyncPanel(): Promise<void> {
-    const val = (sel: string): string =>
-      (this.syncLayer.querySelector(sel) as HTMLInputElement).value.trim();
+    const token = (this.syncLayer.querySelector('#sync-token') as HTMLInputElement).value.trim();
 
-    const token = val('#sync-token');
-    const passphrase = val('#sync-pass');
-
-    if (passphrase.length < 4) {
-      this.notice('本机口令至少 4 位', 'warn');
-      return;
-    }
-
-    // token 空着但本机已配过 ⇒ 当作"输入口令解锁"
-    // （派生密钥不落地，所以每次重开页面都要解锁一次）
     if (token === '') {
-      try {
-        const unlocked = await unlockSettings(passphrase);
-        if (!unlocked) {
-          this.notice('这台设备还没有连接过，或者口令不对', 'warn');
-          return;
-        }
-        await this.connectAccount(unlocked.target, unlocked.token);
-      } catch (err) {
-        this.notice(err instanceof Error ? err.message : String(err), 'error');
+      // 没填 token ⇒ 只是想同步一下。已经登录就直接同步，否则提示去登录
+      if (this.sync?.accountHandle) {
+        this.closeSyncPanel();
+        await this.sync.sync({ force: true });
+      } else {
+        this.notice('请粘贴 GitHub token 后点「登录」', 'warn');
       }
       return;
     }
 
     try {
-      await this.connectWithToken(token, passphrase);
+      await this.connectWithToken(token);
     } catch (err) {
       this.notice(err instanceof Error ? err.message : String(err), 'error');
     }
   }
 
   /** 用 token 连接（面板与自动化测试共用这一条路径）。 */
-  private async connectWithToken(token: string, passphrase: string): Promise<void> {
+  private async connectWithToken(token: string): Promise<void> {
     this.notice('正在确认账号…', 'info');
 
     // ① 先认人。这一步不需要 owner，所以用一个只用来问身份的临时客户端
@@ -438,12 +479,13 @@ class App {
       );
     }
 
-    const target = {
+    const target: SyncTarget = {
       owner: login,
       repo: DATA_REPO_NAME,
       branch: status.defaultBranch || DEFAULT_BRANCH,
     };
-    await saveSettings(target, token, passphrase);
+    // 🔴 登录：把凭据存在这台设备上。token 加密后落地，之后不用再输任何东西
+    await saveCredential(target, token);
 
     this.notice(
       status.created ? `已为 @${login} 创建私有仓库 ${DATA_REPO_NAME}` : `已连接 @${login} 的现有仓库`,
@@ -485,6 +527,7 @@ class App {
       dirty: false,
       lastAdded: 0,
       lastRemoteWon: 0,
+      everPushed: false,
     };
   }
 
@@ -722,9 +765,28 @@ class App {
    *    所以宁可让放大稍钝一点。
    */
   private handleTap(view: BubbleView, at: { x: number; y: number }): void {
+    const now = performance.now();
+
+    // 🔴 同一个泡泡在判别窗口内被第二次按下 ⇒ 这几乎肯定是双击，**取消**待处理的放大。
+    //
+    //    为什么不能只靠"dblclick 事件里 clearTimeout"：
+    //    那是让 220ms 的计时器和事件队列赛跑。主线程一忙（力场在跑、同步在跑），
+    //    dblclick 可能晚于计时器到达 —— 于是浮层先开了，第二次点击打在遮罩上，
+    //    dblclick 永远收不到。表现就是"双击锁定偶尔失灵"（本机反复踩到）。
+    //    改成由**指针事件本身**驱动取消，就和主线程忙不忙无关了。
+    if (this.tapTimer !== 0 && this.lastTapView === view && now - this.lastTapAt < DOUBLE_CLICK_GUARD_MS) {
+      window.clearTimeout(this.tapTimer);
+      this.tapTimer = 0;
+      this.lastTapView = null;
+      return;
+    }
+
+    this.lastTapAt = now;
+    this.lastTapView = view;
     window.clearTimeout(this.tapTimer);
     this.tapTimer = window.setTimeout(() => {
       this.tapTimer = 0;
+      this.lastTapView = null;
       this.zoomToCenter(view, at);
     }, DOUBLE_CLICK_GUARD_MS);
   }
@@ -733,6 +795,7 @@ class App {
   private handleDblClick(view: BubbleView): void {
     window.clearTimeout(this.tapTimer);
     this.tapTimer = 0;
+    this.lastTapView = null;
     this.togglePin(view);
   }
 
@@ -894,18 +957,8 @@ class App {
       onSubmit: (text) => this.addIdea(text),
     });
 
-    // 已经配过备份但本次会话还没解锁：密钥不落地，所以要提示用户再输一次口令
-    if (hasStoredSettings()) {
-      this.renderSyncBar({
-        status: 'idle',
-        detail: '备份已配置 · 点这里输入口令解锁',
-        lastSyncAt: null,
-        lastError: null,
-        dirty: false,
-        lastAdded: 0,
-        lastRemoteWon: 0,
-      });
-    }
+    // 🔴 界面已经在上面画完了，这里才去后台接远端 —— 绝不让界面等同步
+    void this.autoLogin();
 
     this.bindSyncLifecycle();
     this.expose();
@@ -1575,9 +1628,14 @@ class App {
       setAccount: (handle: string | null) => this.sync?.setAccount(handle),
       /** 本机数据的主人。 */
       ownerHandle: () => this.store.getOwnerHandle(),
-      /** 走完整的"用 token 连接"流程（与面板同一条路径）。 */
-      connectWithToken: (token: string, passphrase: string) =>
-        this.connectWithToken(token, passphrase),
+      /** 走完整的"用 token 登录"流程（与面板同一条路径）。 */
+      connectWithToken: (token: string) => this.connectWithToken(token),
+      /** 这台设备是否已登录（能否自动连上远端）。 */
+      isLoggedIn: () => this.sync?.accountHandle !== null,
+      /** 退出登录：抹掉凭据 + 清空本机数据 + 重载。 */
+      logout: () => this.logout(),
+      /** 是否处于安全上下文（决定 token 能否被加密保存）。 */
+      credentialEncrypted: () => isCredentialEncrypted(),
       /** 清空本机数据（切换账号用，测试里直接调）。 */
       wipeLocal: () => this.store.wipeAllData(),
       /** 替换远端客户端工厂（测试注入内存实现）。 */

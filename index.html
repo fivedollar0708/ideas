@@ -52,7 +52,7 @@
 <div id="sync-layer" class="layer" hidden>
   <div class="layer-backdrop"></div>
   <div class="layer-panel" role="dialog" aria-label="备份设置">
-    <h2 class="layer-title">连接 GitHub 备份</h2>
+    <h2 class="layer-title">登录并开启备份</h2>
     <p class="sync-warn">
       🔒 你的想法存在<strong>你自己的私有 GitHub 仓库</strong>里 —— 不经过任何服务器，
       也没有别人能看到。<br>
@@ -67,21 +67,25 @@
         <span class="sync-note">页面拉到最后点绿色的 <strong>Generate token</strong> 就行。</span>
       </li>
       <li>复制那串以 <code>ghp_</code> 或 <code>github_pat_</code> 开头的字符</li>
-      <li>粘到下面，设一个本机口令（至少 4 位），点「连接并备份」</li>
+      <li>粘到下面，点「登录」—— **以后这台设备都会记得你**</li>
     </ol>
 
     <div class="sync-form">
       <label class="sync-field"><span>Token</span>
         <input id="sync-token" type="password" autocomplete="off" placeholder="ghp_…"></label>
-      <label class="sync-field"><span>本机口令</span>
-        <input id="sync-pass" type="password" autocomplete="off" placeholder="至少 4 位"></label>
     </div>
     <p id="sync-account" class="sync-hint"></p>
+    <p class="sync-hint">
+      🔒 token 不会明文存在本机：它用一个<strong>不可导出</strong>的密钥加密后才落地，
+      所以扫描浏览器存储找 token 的恶意程序拿不到东西。<br>
+      ⚠️ 但「能打开这个浏览器的人就能看到你的想法」（和没退出的邮箱一样）。
+      这台设备要借给别人用，请先点「退出登录」。
+    </p>
     <div class="layer-actions">
-      <button id="sync-save" class="btn" type="button">保存并同步</button>
+      <button id="sync-save" class="btn" type="button">登录</button>
       <button id="sync-now" class="btn" type="button">立即同步</button>
       <button id="sync-switch" class="btn btn--danger" type="button" hidden>清空本机并切换到此账号</button>
-      <button id="sync-forget" class="btn btn--danger" type="button">断开备份</button>
+      <button id="sync-forget" class="btn btn--danger" type="button">退出登录</button>
       <button id="sync-close" class="btn" type="button">关闭</button>
     </div>
   </div>
@@ -103,7 +107,7 @@
       aria-label="搜索想法">
     <span id="search-count" class="search-count" aria-live="polite"></span>
   </div>
-  <button id="sync-bar" class="sync-bar" type="button">只存在这台设备 · 点这里开启备份</button>
+  <button id="sync-bar" class="sync-bar" type="button">只存在这台设备 · 点这里登录</button>
   <p id="notice" class="notice" role="status" aria-live="polite"></p>
   <textarea
     id="input"

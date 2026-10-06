@@ -72,6 +72,12 @@ export interface SyncSnapshot {
   /** 本次同步从远端拿回来 / 被远端赢走多少条（用于 UI 反馈）。 */
   lastAdded: number;
   lastRemoteWon: number;
+  /**
+   * 这台设备**成功推过**没有。
+   * 🔴 退出登录会清空本机数据，所以要能回答"有没有备份可以恢复"。
+   *    只看 lastSyncAt 不够 —— 纯拉取成功也会写它，但那时远端可能还是空的。
+   */
+  everPushed: boolean;
 }
 
 /**
@@ -141,6 +147,7 @@ export class SyncEngine {
     dirty: false,
     lastAdded: 0,
     lastRemoteWon: 0,
+    everPushed: false,
   };
 
   private lastPushAt = 0;
@@ -380,6 +387,7 @@ export class SyncEngine {
         lastSyncAt: Date.now(),
         dirty: false,
         lastError: null,
+        everPushed: true,
         lastAdded: report.addedFromRemote.length,
         lastRemoteWon: report.remoteWon.length,
       });

@@ -904,13 +904,13 @@
     const k = target.w > 0 ? src.w / target.w : 1;
     const ox = (pointer.x - src.x) / k;
     const oy = (pointer.y - src.y) / k;
-    const tx = src.x - target.x - ox * (1 - k);
+    const tx2 = src.x - target.x - ox * (1 - k);
     const ty = src.y - target.y - oy * (1 - k);
     return {
       origin: { x: ox, y: oy },
-      start: { x: tx, y: ty },
+      start: { x: tx2, y: ty },
       k,
-      startTransform: `translate(${round(tx)}px, ${round(ty)}px) scale(${round(k, 5)})`
+      startTransform: `translate(${round(tx2)}px, ${round(ty)}px) scale(${round(k, 5)})`
     };
   }
   function round(n, digits = 3) {
@@ -1163,8 +1163,8 @@
     readOne(store, key) {
       const db = this.requireDb();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction(store, "readonly");
-        const req = tx.objectStore(store).get(key);
+        const tx2 = db.transaction(store, "readonly");
+        const req = tx2.objectStore(store).get(key);
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error ?? new Error(`\u8BFB\u53D6 ${store} \u5931\u8D25`));
       });
@@ -1172,8 +1172,8 @@
     readAll(store) {
       const db = this.requireDb();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction(store, "readonly");
-        const req = tx.objectStore(store).getAll();
+        const tx2 = db.transaction(store, "readonly");
+        const req = tx2.objectStore(store).getAll();
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error ?? new Error(`\u8BFB\u53D6 ${store} \u5168\u90E8\u5931\u8D25`));
       });
@@ -1181,8 +1181,8 @@
     readByIndex(store, index, key) {
       const db = this.requireDb();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction(store, "readonly");
-        const req = tx.objectStore(store).index(index).getAll(key);
+        const tx2 = db.transaction(store, "readonly");
+        const req = tx2.objectStore(store).index(index).getAll(key);
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error ?? new Error(`\u6309 ${index} \u8BFB\u53D6 ${store} \u5931\u8D25`));
       });
@@ -1196,15 +1196,15 @@
     write(stores, mutate) {
       const db = this.requireDb();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction(stores, "readwrite");
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error ?? new Error("IndexedDB \u5199\u4E8B\u52A1\u5931\u8D25"));
-        tx.onabort = () => reject(tx.error ?? new Error("IndexedDB \u5199\u4E8B\u52A1\u88AB\u4E2D\u6B62"));
+        const tx2 = db.transaction(stores, "readwrite");
+        tx2.oncomplete = () => resolve();
+        tx2.onerror = () => reject(tx2.error ?? new Error("IndexedDB \u5199\u4E8B\u52A1\u5931\u8D25"));
+        tx2.onabort = () => reject(tx2.error ?? new Error("IndexedDB \u5199\u4E8B\u52A1\u88AB\u4E2D\u6B62"));
         try {
-          mutate(tx);
+          mutate(tx2);
         } catch (err) {
           try {
-            tx.abort();
+            tx2.abort();
           } catch {
           }
           reject(err);
@@ -1213,8 +1213,8 @@
     }
     // ── spaces ─────────────────────────────────────────────────
     putSpace(space) {
-      return this.write([STORE_SPACES], (tx) => {
-        tx.objectStore(STORE_SPACES).put(space);
+      return this.write([STORE_SPACES], (tx2) => {
+        tx2.objectStore(STORE_SPACES).put(space);
       });
     }
     getSpace(id) {
@@ -1227,21 +1227,21 @@
       return list.sort((a, b) => a.createdAt - b.createdAt);
     }
     hardDeleteSpace(id) {
-      return this.write([STORE_SPACES], (tx) => {
-        tx.objectStore(STORE_SPACES).delete(id);
+      return this.write([STORE_SPACES], (tx2) => {
+        tx2.objectStore(STORE_SPACES).delete(id);
       });
     }
     // ── ideas ──────────────────────────────────────────────────
     putIdea(idea) {
-      return this.write([STORE_IDEAS], (tx) => {
-        tx.objectStore(STORE_IDEAS).put(idea);
+      return this.write([STORE_IDEAS], (tx2) => {
+        tx2.objectStore(STORE_IDEAS).put(idea);
       });
     }
     /** 批量写入，单事务 —— 多设备合并拉回大量记录时用。 */
     putIdeas(ideas) {
       if (ideas.length === 0) return Promise.resolve();
-      return this.write([STORE_IDEAS], (tx) => {
-        const s = tx.objectStore(STORE_IDEAS);
+      return this.write([STORE_IDEAS], (tx2) => {
+        const s = tx2.objectStore(STORE_IDEAS);
         for (const idea of ideas) s.put(idea);
       });
     }
@@ -1260,15 +1260,15 @@
     countIdeasBySpace(spaceId) {
       const db = this.requireDb();
       return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_IDEAS, "readonly");
-        const req = tx.objectStore(STORE_IDEAS).index("spaceId").count(spaceId);
+        const tx2 = db.transaction(STORE_IDEAS, "readonly");
+        const req = tx2.objectStore(STORE_IDEAS).index("spaceId").count(spaceId);
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error ?? new Error("\u7EDF\u8BA1\u60F3\u6CD5\u6570\u91CF\u5931\u8D25"));
       });
     }
     hardDeleteIdea(id) {
-      return this.write([STORE_IDEAS], (tx) => {
-        tx.objectStore(STORE_IDEAS).delete(id);
+      return this.write([STORE_IDEAS], (tx2) => {
+        tx2.objectStore(STORE_IDEAS).delete(id);
       });
     }
     // ── meta ───────────────────────────────────────────────────
@@ -1277,13 +1277,13 @@
       return rec?.value;
     }
     setMeta(key, value) {
-      return this.write([STORE_META], (tx) => {
-        tx.objectStore(STORE_META).put({ key, value });
+      return this.write([STORE_META], (tx2) => {
+        tx2.objectStore(STORE_META).put({ key, value });
       });
     }
     deleteMeta(key) {
-      return this.write([STORE_META], (tx) => {
-        tx.objectStore(STORE_META).delete(key);
+      return this.write([STORE_META], (tx2) => {
+        tx2.objectStore(STORE_META).delete(key);
       });
     }
     /**
@@ -1312,11 +1312,11 @@
      *    因为这一步之后，本机就再也看不到原来那个账号的数据了。
      */
     wipeAllData() {
-      return this.write([STORE_SPACES, STORE_IDEAS, STORE_TRASH, STORE_META], (tx) => {
-        tx.objectStore(STORE_SPACES).clear();
-        tx.objectStore(STORE_IDEAS).clear();
-        tx.objectStore(STORE_TRASH).clear();
-        tx.objectStore(STORE_META).clear();
+      return this.write([STORE_SPACES, STORE_IDEAS, STORE_TRASH, STORE_META], (tx2) => {
+        tx2.objectStore(STORE_SPACES).clear();
+        tx2.objectStore(STORE_IDEAS).clear();
+        tx2.objectStore(STORE_TRASH).clear();
+        tx2.objectStore(STORE_META).clear();
       });
     }
     /** 已被彻底清理的 id（空间与想法混合）。 */
@@ -1339,21 +1339,21 @@
     }
     // ── trash ──────────────────────────────────────────────────
     putTrash(entry) {
-      return this.write([STORE_TRASH], (tx) => {
-        tx.objectStore(STORE_TRASH).put(entry);
+      return this.write([STORE_TRASH], (tx2) => {
+        tx2.objectStore(STORE_TRASH).put(entry);
       });
     }
     getAllTrash() {
       return this.readAll(STORE_TRASH);
     }
     deleteTrash(id) {
-      return this.write([STORE_TRASH], (tx) => {
-        tx.objectStore(STORE_TRASH).delete(id);
+      return this.write([STORE_TRASH], (tx2) => {
+        tx2.objectStore(STORE_TRASH).delete(id);
       });
     }
     clearTrash() {
-      return this.write([STORE_TRASH], (tx) => {
-        tx.objectStore(STORE_TRASH).clear();
+      return this.write([STORE_TRASH], (tx2) => {
+        tx2.objectStore(STORE_TRASH).clear();
       });
     }
     /**
@@ -1386,9 +1386,9 @@
         space: tombstone,
         ideas
       };
-      await this.write([STORE_SPACES, STORE_TRASH], (tx) => {
-        tx.objectStore(STORE_SPACES).put(tombstone);
-        tx.objectStore(STORE_TRASH).put(entry);
+      await this.write([STORE_SPACES, STORE_TRASH], (tx2) => {
+        tx2.objectStore(STORE_SPACES).put(tombstone);
+        tx2.objectStore(STORE_TRASH).put(entry);
       });
       return entry;
     }
@@ -1408,11 +1408,11 @@
       const restored = { ...entry.space, name, deleted: 0, purgeAt: 0, updatedAt: now };
       const existingIds = new Set((await this.readAll(STORE_IDEAS)).map((i) => i.id));
       const missing = (entry.ideas ?? []).filter((i) => !existingIds.has(i.id));
-      await this.write([STORE_SPACES, STORE_IDEAS, STORE_TRASH], (tx) => {
-        tx.objectStore(STORE_SPACES).put(restored);
-        const ideas = tx.objectStore(STORE_IDEAS);
+      await this.write([STORE_SPACES, STORE_IDEAS, STORE_TRASH], (tx2) => {
+        tx2.objectStore(STORE_SPACES).put(restored);
+        const ideas = tx2.objectStore(STORE_IDEAS);
         for (const idea of missing) ideas.put({ ...idea, spaceId: restored.id });
-        tx.objectStore(STORE_TRASH).delete(entry.id);
+        tx2.objectStore(STORE_TRASH).delete(entry.id);
       });
       return restored;
     }
@@ -1483,10 +1483,10 @@
      */
     async purgeEntries(entries) {
       const gone = [];
-      await this.write([STORE_TRASH, STORE_SPACES, STORE_IDEAS], (tx) => {
-        const trash = tx.objectStore(STORE_TRASH);
-        const spaces = tx.objectStore(STORE_SPACES);
-        const ideas = tx.objectStore(STORE_IDEAS);
+      await this.write([STORE_TRASH, STORE_SPACES, STORE_IDEAS], (tx2) => {
+        const trash = tx2.objectStore(STORE_TRASH);
+        const spaces = tx2.objectStore(STORE_SPACES);
+        const ideas = tx2.objectStore(STORE_IDEAS);
         for (const entry of entries) {
           trash.delete(entry.id);
           if (entry.kind === "space" && entry.space) {
@@ -1809,91 +1809,87 @@
   }
 
   // src/sync/settings.ts
-  var KEY_SETTINGS = "nebula.sync.settings";
-  var PBKDF2_ITERATIONS = 12e4;
-  function bytesToB64(bytes) {
-    let binary = "";
-    for (let i = 0; i < bytes.length; i += 32768) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  var DB_NAME2 = "nebula-credentials";
+  var DB_VERSION2 = 1;
+  var STORE = "credentials";
+  var RECORD_KEY = "github";
+  function hasSubtle() {
+    return typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
+  }
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME2, DB_VERSION2);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error("\u6253\u4E0D\u5F00\u51ED\u636E\u5E93"));
+    });
+  }
+  function tx(mode, fn) {
+    return openDb().then(
+      (db) => new Promise((resolve, reject) => {
+        const t = db.transaction(STORE, mode);
+        const req = fn(t.objectStore(STORE));
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error ?? new Error("\u51ED\u636E\u8BFB\u5199\u5931\u8D25"));
+        t.oncomplete = () => db.close();
+      })
+    );
+  }
+  async function saveCredential(target, token) {
+    let record;
+    if (hasSubtle()) {
+      const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+        "encrypt",
+        "decrypt"
+      ]);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const cipher = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv },
+        key,
+        new TextEncoder().encode(token)
+      );
+      record = { target, cipher, iv, key, plain: null };
+    } else {
+      record = { target, cipher: null, iv: null, key: null, plain: token };
     }
-    return btoa(binary);
+    await tx("readwrite", (store) => store.put(record, RECORD_KEY));
   }
-  function b64ToBytes(b64) {
-    const binary = atob(b64);
-    const out = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-    return out;
-  }
-  async function deriveKey(passphrase, salt) {
-    const material = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(passphrase),
-      "PBKDF2",
-      false,
-      ["deriveKey"]
-    );
-    return crypto.subtle.deriveKey(
-      { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
-      material,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["encrypt", "decrypt"]
-    );
-  }
-  async function encryptToken(token, passphrase) {
-    if (passphrase.length < 4) {
-      throw new Error("\u53E3\u4EE4\u81F3\u5C11 4 \u4F4D \u2014\u2014 \u592A\u77ED\u7684\u8BDD\u52A0\u5BC6\u5F62\u540C\u865A\u8BBE");
+  async function loadCredential() {
+    let record;
+    try {
+      record = await tx("readonly", (store) => store.get(RECORD_KEY));
+    } catch {
+      return null;
     }
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await deriveKey(passphrase, salt);
-    const cipher = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
-      key,
-      new TextEncoder().encode(token)
-    );
-    return { salt: bytesToB64(salt), iv: bytesToB64(iv), cipher: bytesToB64(new Uint8Array(cipher)) };
-  }
-  async function decryptToken(parts, passphrase) {
-    const key = await deriveKey(passphrase, b64ToBytes(parts.salt));
+    if (!record?.target) return null;
+    if (record.plain) return { target: record.target, token: record.plain };
+    if (!record.key || !record.cipher || !record.iv) return null;
     try {
       const plain = await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: b64ToBytes(parts.iv) },
-        key,
-        b64ToBytes(parts.cipher)
+        { name: "AES-GCM", iv: record.iv },
+        record.key,
+        record.cipher
       );
-      return new TextDecoder().decode(plain);
-    } catch {
-      throw new Error("\u53E3\u4EE4\u4E0D\u5BF9\uFF08\u6216\u8BBE\u7F6E\u5DF2\u635F\u574F\uFF09\uFF0C\u65E0\u6CD5\u89E3\u51FA token");
-    }
-  }
-  function loadStoredSettings() {
-    const raw = localStorage.getItem(KEY_SETTINGS);
-    if (!raw) return null;
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed.version !== 1 || !parsed.target) return null;
-      return parsed;
+      return { target: record.target, token: new TextDecoder().decode(plain) };
     } catch {
       return null;
     }
   }
-  async function saveSettings(target, token, passphrase) {
-    const parts = await encryptToken(token, passphrase);
-    const stored = { version: 1, target, ...parts };
-    localStorage.setItem(KEY_SETTINGS, JSON.stringify(stored));
+  async function clearCredential() {
+    await tx("readwrite", (store) => store.delete(RECORD_KEY));
   }
-  async function unlockSettings(passphrase) {
-    const stored = loadStoredSettings();
-    if (!stored) return null;
-    const token = await decryptToken(stored, passphrase);
-    return { target: stored.target, token };
+  async function credentialRecordExists() {
+    try {
+      return await tx("readonly", (store) => store.get(RECORD_KEY)) !== void 0;
+    } catch {
+      return false;
+    }
   }
-  function forgetSettings() {
-    localStorage.removeItem(KEY_SETTINGS);
-  }
-  function hasStoredSettings() {
-    return loadStoredSettings() !== null;
+  function isCredentialEncrypted() {
+    return hasSubtle();
   }
 
   // src/sync/syncEngine.ts
@@ -1953,7 +1949,8 @@
       lastError: null,
       dirty: false,
       lastAdded: 0,
-      lastRemoteWon: 0
+      lastRemoteWon: 0,
+      everPushed: false
     };
     lastPushAt = 0;
     timer = 0;
@@ -2121,6 +2118,7 @@
           lastSyncAt: Date.now(),
           dirty: false,
           lastError: null,
+          everPushed: true,
           lastAdded: report.addedFromRemote.length,
           lastRemoteWon: report.remoteWon.length
         });
@@ -2932,6 +2930,9 @@
     positionSaveTimer = 0;
     /** 待处理的单击（等双击判别窗口过去才真正放大）。 */
     tapTimer = 0;
+    /** 上一次单击的泡泡与时刻 —— 用来识别"同一位置的第二次按下"。 */
+    lastTapView = null;
+    lastTapAt = 0;
     constructor() {
       this.stage = must("#stage");
       this.world = must("#world");
@@ -2996,13 +2997,57 @@
         "click",
         () => void this.switchAccount()
       );
-      layer.querySelector("#sync-forget").addEventListener("click", () => {
-        forgetSettings();
-        this.sync?.setRemote(null);
-        this.sync?.setAccount(null);
-        this.notice("\u5DF2\u6E05\u9664\u672C\u673A\u7684\u5907\u4EFD\u8BBE\u7F6E\uFF08GitHub \u4E0A\u7684\u6570\u636E\u4E0D\u53D7\u5F71\u54CD\uFF09", "info");
-        this.closeSyncPanel();
-      });
+      layer.querySelector("#sync-forget").addEventListener(
+        "click",
+        () => void this.logout()
+      );
+    }
+    /**
+     * 启动时自动登录。
+     *
+     * 🔴 调用时机很关键：**上面已经把本地数据渲染完了**，这里只是后台接上远端。
+     *    绝不能出现"等同步完再显示" —— 那样每次打开都要盯着一片空星云。
+     */
+    async autoLogin() {
+      const cred = await loadCredential();
+      if (!cred) {
+        if (await credentialRecordExists()) {
+          this.renderSyncBar(this.syncBarText("\u767B\u5F55\u5DF2\u5931\u6548 \xB7 \u70B9\u8FD9\u91CC\u91CD\u65B0\u767B\u5F55"));
+        }
+        return;
+      }
+      this.sync?.setAccount(cred.target.owner);
+      this.sync?.setRemote(
+        this.remoteFactory({ token: cred.token, ...cred.target })
+      );
+      this.renderSyncBar(this.syncBarText(`@${cred.target.owner} \xB7 \u6B63\u5728\u540C\u6B65\u2026`));
+      await this.sync?.sync();
+    }
+    /**
+     * 退出登录。
+     *
+     * 🔴 这是唯一"会清空本机数据"的用户操作，所以确认框要按实际情况给不同的话：
+     *    备份过 ⇒ 告诉他数据在 GitHub 上，重新登录能取回；
+     *    从没备份过 ⇒ 明确警告"数据会真的消失"。
+     */
+    async logout() {
+      const owner = await this.store.getOwnerHandle() ?? "\u8FD9\u4E2A\u8D26\u53F7";
+      const backedUp = this.sync?.snapshot.everPushed === true;
+      const ok = window.confirm(
+        backedUp ? `\u9000\u51FA\u767B\u5F55\u4F1A\u6E05\u7A7A\u8FD9\u53F0\u8BBE\u5907\u4E0A\u7684\u6570\u636E\u3002
+
+@${owner} \u7684\u60F3\u6CD5\u5728\u4ED6\u7684 GitHub \u5907\u4EFD\u91CC\uFF0C\u91CD\u65B0\u767B\u5F55\u5C31\u80FD\u53D6\u56DE\u3002
+
+\u786E\u5B9A\u9000\u51FA\uFF1F` : `\u26A0\uFE0F \u8FD9\u53F0\u8BBE\u5907\u4ECE\u6765\u6CA1\u6709\u6210\u529F\u5907\u4EFD\u8FC7\u3002
+
+\u9000\u51FA\u767B\u5F55\u4F1A\u6E05\u7A7A\u672C\u673A\u6570\u636E\uFF0C\u800C\u4E14\u6CA1\u6709\u5907\u4EFD\u53EF\u4EE5\u6062\u590D \u2014\u2014 \u6570\u636E\u4F1A\u771F\u7684\u6D88\u5931\u3002
+
+\u4ECD\u7136\u8981\u9000\u51FA\u5417\uFF1F`
+      );
+      if (!ok) return;
+      await clearCredential();
+      await this.store.wipeAllData();
+      location.reload();
     }
     /** 把本地权威数据读成一份同步文档。 */
     async readLocalDoc() {
@@ -3069,17 +3114,18 @@
       this.syncBar.textContent = snap.detail || "\u53EA\u5B58\u5728\u8FD9\u53F0\u8BBE\u5907";
     }
     openSyncPanel() {
-      const stored = loadStoredSettings();
       const accountEl = this.syncLayer.querySelector("#sync-account");
       const switchBtn = this.syncLayer.querySelector("#sync-switch");
-      void this.store.getOwnerHandle().then((localOwner) => {
-        if (stored) {
-          accountEl.textContent = `\u5DF2\u8FDE\u63A5\uFF1A@${stored.target.owner}/${stored.target.repo}\uFF08${stored.target.branch}\uFF09`;
-        } else {
-          accountEl.textContent = "";
+      void Promise.all([loadCredential(), this.store.getOwnerHandle()]).then(
+        ([cred, localOwner]) => {
+          if (cred) {
+            accountEl.textContent = `\u5DF2\u767B\u5F55\uFF1A@${cred.target.owner}/${cred.target.repo}\uFF08${cred.target.branch}\uFF09` + (isCredentialEncrypted() ? "" : " \xB7 \u26A0\uFE0F \u5F53\u524D\u4E0D\u662F HTTPS\uFF0Ctoken \u53EA\u80FD\u660E\u6587\u4FDD\u5B58");
+          } else {
+            accountEl.textContent = "";
+          }
+          switchBtn.hidden = !(localOwner && cred && localOwner !== cred.target.owner);
         }
-        switchBtn.hidden = !(localOwner && stored && localOwner !== stored.target.owner);
-      });
+      );
       this.syncLayer.hidden = false;
       this.syncLayer.classList.add("layer--visible");
     }
@@ -3096,34 +3142,24 @@
      * 这就是"零服务端的 GitHub 登录"能到达的最好体验。
      */
     async applySyncPanel() {
-      const val = (sel) => this.syncLayer.querySelector(sel).value.trim();
-      const token = val("#sync-token");
-      const passphrase = val("#sync-pass");
-      if (passphrase.length < 4) {
-        this.notice("\u672C\u673A\u53E3\u4EE4\u81F3\u5C11 4 \u4F4D", "warn");
-        return;
-      }
+      const token = this.syncLayer.querySelector("#sync-token").value.trim();
       if (token === "") {
-        try {
-          const unlocked = await unlockSettings(passphrase);
-          if (!unlocked) {
-            this.notice("\u8FD9\u53F0\u8BBE\u5907\u8FD8\u6CA1\u6709\u8FDE\u63A5\u8FC7\uFF0C\u6216\u8005\u53E3\u4EE4\u4E0D\u5BF9", "warn");
-            return;
-          }
-          await this.connectAccount(unlocked.target, unlocked.token);
-        } catch (err) {
-          this.notice(err instanceof Error ? err.message : String(err), "error");
+        if (this.sync?.accountHandle) {
+          this.closeSyncPanel();
+          await this.sync.sync({ force: true });
+        } else {
+          this.notice("\u8BF7\u7C98\u8D34 GitHub token \u540E\u70B9\u300C\u767B\u5F55\u300D", "warn");
         }
         return;
       }
       try {
-        await this.connectWithToken(token, passphrase);
+        await this.connectWithToken(token);
       } catch (err) {
         this.notice(err instanceof Error ? err.message : String(err), "error");
       }
     }
     /** 用 token 连接（面板与自动化测试共用这一条路径）。 */
-    async connectWithToken(token, passphrase) {
+    async connectWithToken(token) {
       this.notice("\u6B63\u5728\u786E\u8BA4\u8D26\u53F7\u2026", "info");
       const probe = this.remoteFactory({ token, owner: "", repo: "", branch: DEFAULT_BRANCH });
       const { login } = await probe.identify();
@@ -3144,7 +3180,7 @@
         repo: DATA_REPO_NAME,
         branch: status.defaultBranch || DEFAULT_BRANCH
       };
-      await saveSettings(target, token, passphrase);
+      await saveCredential(target, token);
       this.notice(
         status.created ? `\u5DF2\u4E3A @${login} \u521B\u5EFA\u79C1\u6709\u4ED3\u5E93 ${DATA_REPO_NAME}` : `\u5DF2\u8FDE\u63A5 @${login} \u7684\u73B0\u6709\u4ED3\u5E93`,
         "info"
@@ -3177,7 +3213,8 @@
         lastError: null,
         dirty: false,
         lastAdded: 0,
-        lastRemoteWon: 0
+        lastRemoteWon: 0,
+        everPushed: false
       };
     }
     /**
@@ -3372,9 +3409,19 @@
      *    所以宁可让放大稍钝一点。
      */
     handleTap(view, at) {
+      const now = performance.now();
+      if (this.tapTimer !== 0 && this.lastTapView === view && now - this.lastTapAt < DOUBLE_CLICK_GUARD_MS) {
+        window.clearTimeout(this.tapTimer);
+        this.tapTimer = 0;
+        this.lastTapView = null;
+        return;
+      }
+      this.lastTapAt = now;
+      this.lastTapView = view;
       window.clearTimeout(this.tapTimer);
       this.tapTimer = window.setTimeout(() => {
         this.tapTimer = 0;
+        this.lastTapView = null;
         this.zoomToCenter(view, at);
       }, DOUBLE_CLICK_GUARD_MS);
     }
@@ -3382,6 +3429,7 @@
     handleDblClick(view) {
       window.clearTimeout(this.tapTimer);
       this.tapTimer = 0;
+      this.lastTapView = null;
       this.togglePin(view);
     }
     // ── 放大到中央（FLIP）────────────────────────────────
@@ -3516,17 +3564,7 @@
         onNotice: this.notice,
         onSubmit: (text) => this.addIdea(text)
       });
-      if (hasStoredSettings()) {
-        this.renderSyncBar({
-          status: "idle",
-          detail: "\u5907\u4EFD\u5DF2\u914D\u7F6E \xB7 \u70B9\u8FD9\u91CC\u8F93\u5165\u53E3\u4EE4\u89E3\u9501",
-          lastSyncAt: null,
-          lastError: null,
-          dirty: false,
-          lastAdded: 0,
-          lastRemoteWon: 0
-        });
-      }
+      void this.autoLogin();
       this.bindSyncLifecycle();
       this.expose();
       this.bindSelfTest();
@@ -4053,8 +4091,14 @@
         setAccount: (handle) => this.sync?.setAccount(handle),
         /** 本机数据的主人。 */
         ownerHandle: () => this.store.getOwnerHandle(),
-        /** 走完整的"用 token 连接"流程（与面板同一条路径）。 */
-        connectWithToken: (token, passphrase) => this.connectWithToken(token, passphrase),
+        /** 走完整的"用 token 登录"流程（与面板同一条路径）。 */
+        connectWithToken: (token) => this.connectWithToken(token),
+        /** 这台设备是否已登录（能否自动连上远端）。 */
+        isLoggedIn: () => this.sync?.accountHandle !== null,
+        /** 退出登录：抹掉凭据 + 清空本机数据 + 重载。 */
+        logout: () => this.logout(),
+        /** 是否处于安全上下文（决定 token 能否被加密保存）。 */
+        credentialEncrypted: () => isCredentialEncrypted(),
         /** 清空本机数据（切换账号用，测试里直接调）。 */
         wipeLocal: () => this.store.wipeAllData(),
         /** 替换远端客户端工厂（测试注入内存实现）。 */

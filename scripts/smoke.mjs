@@ -1648,7 +1648,7 @@ async function main() {
     await sleep(300);
 
     await evaluate(cdp, `window.__mock.setAccount('alice')`);
-    await evaluate(cdp, `window.__nebula.connectWithToken('ghp_fake_token', 'pass1234')`);
+    await evaluate(cdp, `window.__nebula.connectWithToken('ghp_fake_token')`);
     await sleep(1500);
 
     ok(
@@ -1703,6 +1703,49 @@ async function main() {
     ok(
       (await readLocalNow()).ideas.length === 0,
       '演练12：新账号从零开始（alice 的数据不在本机了，但在她的备份里）',
+    );
+
+    console.log('\n── 演练13：重开页面不用再登录 ──');
+
+    // 先在 bob 的账号下同步一次，让凭据真正落盘
+    await typeAndEnter(cdp, 'bob 的一条想法');
+    await evaluate(cdp, `window.__nebula.syncDirty()`);
+    await runSync(1000);
+    ok(
+      (await evaluate(cdp, `window.__nebula.syncState()`)).everPushed === true,
+      '演练13：已经成功备份过（退出登录时才敢说"数据能取回"）',
+    );
+
+    // 🔴 把真实 GitHub 域名挡掉：重载后应用会尝试自动连远端，
+    //    我们不希望测试去打真实网络（假 token 会挂 12 秒）
+    await cdp.send('Network.enable');
+    await cdp.send('Network.setBlockedURLs', { urls: ['https://api.github.com/*'] });
+
+    await cdp.send('Page.reload', { ignoreCache: true });
+    await sleep(500);
+    await waitUntil(cdp, `document.readyState === 'complete' && !!window.__nebula`, 10000);
+    await sleep(1200);
+
+    ok(
+      (await evaluate(cdp, `window.__nebula.isLoggedIn()`)) === true,
+      '🔴 演练13：重载后**没有输入任何东西**就已经是登录状态（凭据留在本机且能解开）',
+    );
+
+    await cdp.send('Network.setBlockedURLs', { urls: [] });
+
+    // 接回模拟远端，确认自动登录拿到的是**能用的**凭据
+    await installMockRemote();
+    await runSync(1200);
+    const resumed = JSON.parse(await evaluate(cdp, `window.__mock.read('data/ideas.json')`));
+    ok(
+      resumed.ideas.some((i) => i.text === 'bob 的一条想法'),
+      '演练13：自动登录拿到的凭据真的能用（数据继续同步）',
+    );
+
+    // 退出登录之后就不该再自动登录了
+    ok(
+      typeof (await evaluate(cdp, `typeof window.__nebula.logout`)) === 'string',
+      '演练13：有明确的退出登录入口',
     );
   } finally {
     try {
