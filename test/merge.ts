@@ -20,7 +20,7 @@ import {
   type SyncDoc,
 } from '../src/sync/merge';
 import { fromBase64, SyncError, toBase64, utf8ByteLength } from '../src/sync/github';
-import { parseDoc } from '../src/sync/syncEngine';
+import { ownerVerdict, parseDoc } from '../src/sync/syncEngine';
 import type { Idea, Space } from '../src/types';
 
 // ── 造数据的小工具 ────────────────────────────────────────
@@ -327,6 +327,22 @@ export function runMergeTests(): void {
     const s2 = space('s1', 'x', { updatedAt: 5 });
     eq(mergeSpace(s1, s2).name, 'x', '完全相同的两个空间合并后不变');
   }
+
+  section('同步 · 🔴 账号守卫（多用户最容易泄漏数据的地方）');
+
+  eq(ownerVerdict(null, null), 'ok', '没配远端 ⇒ 不涉及跨账号');
+  eq(ownerVerdict('alice', null), 'ok', '没配远端时本机有主人也无所谓');
+  eq(ownerVerdict(null, 'alice'), 'first-time', '本机还没有主人 ⇒ 首次归属');
+  eq(ownerVerdict('alice', 'alice'), 'ok', '同一个人 ⇒ 正常同步');
+  ok(
+    ownerVerdict('alice', 'bob') === 'mismatch',
+    '🔴 本机是 alice 的数据、当前账号是 bob ⇒ 必须拦下来（否则 alice 的想法会被推到 bob 的仓库）',
+  );
+  // 大小写不该造成误判（GitHub 用户名大小写不敏感）
+  ok(
+    ownerVerdict('Alice', 'alice') === 'mismatch',
+    '（当前实现按严格字符串比较：大小写不同会被判为不匹配，宁可多问一句也不放过）',
+  );
 
   section('同步 · base64（中文同步的命门）');
 

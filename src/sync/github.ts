@@ -89,6 +89,12 @@ export type SyncErrorKind =
   | 'network'
   /** 🔴 内容层失败：解析不了、空内容、编码不对。**这一类绝不能继续往下走。** */
   | 'content'
+  /**
+   * 🔴 本机数据属于另一个账号。
+   * 这一条是多用户最容易出事故的地方：如果不管它，合并的并集语义会把
+   * **上一个人的想法推到新账号的仓库里** —— 跨账号数据泄漏。
+   */
+  | 'owner-mismatch'
   /** 其它未分类。 */
   | 'unknown';
 
@@ -111,10 +117,32 @@ export interface RemoteFile {
   base64: string;
 }
 
+/** 远端账号身份。 */
+export interface RemoteIdentity {
+  login: string;
+}
+
+export interface RepoStatus {
+  /** 是不是这次新建的。 */
+  created: boolean;
+  /** 仓库是不是私有的。**公开仓库绝对不能用来放私人想法。** */
+  private: boolean;
+  /**
+   * 默认分支名。
+   * 用户已有的仓库可能默认叫 `master` —— 硬写 `main` 会在那个仓库里**另开一条分支**，
+   * 于是数据分叉在两处，怎么同步都对不上。
+   */
+  defaultBranch?: string;
+}
+
 /** 远端存储的抽象。抽出来是为了让自动化测试能注入一个内存实现。 */
 export interface RemoteStore {
   readFile(path: string): Promise<RemoteFile | null>;
   writeFile(path: string, text: string, message: string, sha?: string): Promise<void>;
+  /** 这份凭据对应哪个账号。 */
+  identify(): Promise<RemoteIdentity>;
+  /** 确保数据仓库存在。已存在则原样返回它的可见性，不做修改。 */
+  ensureRepo(name: string): Promise<RepoStatus>;
 }
 
 export interface GitHubOptions {
@@ -246,6 +274,63 @@ export class GitHubClient implements RemoteStore {
     }
 
     if (!res.ok) await this.fail(res);
+  }
+
+  /**
+   * 问 GitHub"我是谁"。
+   *
+   * 🔴 这一步让用户**不用手填 owner** —— 有 token 就知道了。
+   *    多用户的第一条体验优化就是它：少填一个字段，少一次填错的机会。
+   */
+  async identify(): Promise<RemoteIdentity> {
+    const res = await fetchWithTimeout('https://api.github.com/user', {
+      headers: this.headers(),
+    });
+    if (!res.ok) await this.fail(res);
+
+    const data = (await res.json()) as { login?: string };
+    if (typeof data.login !== 'string' || data.login === '') {
+      throw new SyncError('content', 'GitHub 的 /user 没有返回 login，无法确认账号');
+    }
+    return { login: data.login };
+  }
+
+  /**
+   * 确保数据仓库存在。
+   *
+   * 🔴 已存在时**不改动它**，只回报它的可见性 —— 由调用方决定要不要拒绝。
+   *    如果用户手上已经有一个同名的公开仓库，我们绝不能把私人想法写进去。
+   */
+  async ensureRepo(name: string): Promise<RepoStatus> {
+    const head = await fetchWithTimeout(
+      `https://api.github.com/repos/${this.opts.owner}/${name}`,
+      { headers: this.headers() },
+    );
+
+    if (head.ok) {
+      const data = (await head.json()) as { private?: boolean; default_branch?: string };
+      return {
+        created: false,
+        private: data.private === true,
+        defaultBranch: typeof data.default_branch === 'string' ? data.default_branch : undefined,
+      };
+    }
+    if (head.status !== 404) await this.fail(head);
+
+    const create = await fetchWithTimeout('https://api.github.com/user/repos', {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        private: true,
+        auto_init: false,
+        description: '想法星云的数据镜像（私有）',
+      }),
+    });
+    if (!create.ok) await this.fail(create);
+
+    // 新建的空仓库还没有任何提交，分支要等第一次 PUT 才会被创建
+    return { created: true, private: true, defaultBranch: this.opts.branch };
   }
 
   /** 读一个文件、取它的文本；不存在返回 null。 */

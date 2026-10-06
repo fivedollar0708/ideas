@@ -74,11 +74,30 @@ export interface SyncSnapshot {
   lastRemoteWon: number;
 }
 
+/**
+ * 本机数据的主人 vs 当前账号。
+ *
+ * 🔴 这个判断必须发生在**读本地数据之前**。
+ *    合并是并集语义，一旦把 A 的数据读进来和 B 的仓库合并，
+ *    A 的私人想法就会被推上去 —— 而且推完就撤不回来了。
+ */
+export type OwnerVerdict = 'ok' | 'first-time' | 'mismatch';
+
+export function ownerVerdict(localOwner: string | null, account: string | null): OwnerVerdict {
+  if (!account) return 'ok'; // 没配远端，不涉及跨账号
+  if (!localOwner) return 'first-time';
+  return localOwner === account ? 'ok' : 'mismatch';
+}
+
 export interface SyncDeps {
   /** 当前远端。null = 还没配置（纯本地模式）。 */
   remote: RemoteStore | null;
   readLocal(): Promise<SyncDoc>;
   writeLocal(doc: SyncDoc): Promise<void>;
+  /** 本机数据的主人（GitHub 用户名）。 */
+  readOwnerHandle(): Promise<string | null>;
+  /** 首次归属时写下主人。 */
+  writeOwnerHandle(handle: string): Promise<void>;
   /** 合并落地后的反馈（把差异画到 UI 上）。 */
   onMerged?(report: MergeReport, doc: SyncDoc, source: SyncDoc): void;
   onState?(snapshot: SyncSnapshot): void;
@@ -128,6 +147,8 @@ export class SyncEngine {
   private timer = 0;
   private running = false;
   private channel: BroadcastChannel | null = null;
+  /** 当前远端凭据对应的账号（由上层在配置时通过 setAccount 告知）。 */
+  private account: string | null = null;
   /** 上一次成功写进 backup 的内容，用来避免"内容没变也产生一个 commit"。 */
   private lastBackupBody: string | null = null;
 
@@ -145,6 +166,15 @@ export class SyncEngine {
 
   get snapshot(): SyncSnapshot {
     return this.snapshotValue;
+  }
+
+  /** 告知引擎"这份凭据是谁的"。做账号守卫要用。 */
+  setAccount(handle: string | null): void {
+    this.account = handle;
+  }
+
+  get accountHandle(): string | null {
+    return this.account;
   }
 
   setRemote(remote: RemoteStore | null): void {
@@ -203,6 +233,18 @@ export class SyncEngine {
     this.patch({ status: 'pulling', detail: '正在同步…', lastError: null });
 
     try {
+      // ── 0. 🔴 账号守卫（必须在读本地数据之前）──
+      const localOwner = await this.deps.readOwnerHandle();
+      const verdict = ownerVerdict(localOwner, this.account);
+
+      if (verdict === 'mismatch') {
+        throw new SyncError(
+          'owner-mismatch',
+          `这台设备上的数据属于 @${localOwner}，而当前账号是 @${this.account}。` +
+            `为了不把 @${localOwner} 的想法推到 @${this.account} 的仓库里，同步已停止。`,
+        );
+      }
+
       // ── 1. 读远端配置 ──
       let config = defaultConfig();
       const configFile = await remote.readFile(CONFIG_PATH);
@@ -244,6 +286,15 @@ export class SyncEngine {
           // 文件还不存在 ⇒ 首次同步，视为空文档
           remoteDoc = emptyDoc();
         }
+      }
+
+      // 🔴 首次连接 ⇒ 立刻把本机数据认给这个账号。
+      //    不能等到"有东西要推"才写：一个空账号连上来、当时没东西可推，
+      //    本机数据就会一直处于"无主"状态 —— 那么换账号时守不住，
+      //    上一个人的想法会被推到下一个人的仓库里。
+      //    放在这里（远端已经读通之后）是刻意的：先证明这账号真的能用，再认领。
+      if (verdict === 'first-time' && this.account) {
+        await this.deps.writeOwnerHandle(this.account);
       }
 
       // ── 3. 本地 ──
@@ -325,7 +376,7 @@ export class SyncEngine {
       this.lastPushAt = Date.now();
       this.patch({
         status: 'idle',
-        detail: `已备份 · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`,
+        detail: `@${this.account ?? ''} 已备份 · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`,
         lastSyncAt: Date.now(),
         dirty: false,
         lastError: null,
@@ -435,6 +486,8 @@ function detailFor(kind: SyncErrorKind, message: string): string {
       return '备份失败：远端内容异常 · 已停止同步以保护本地数据';
     case 'conflict':
       return '备份失败：版本冲突 · 会重试';
+    case 'owner-mismatch':
+      return '本机数据属于另一个账号 · 点此处理';
     default:
       return `备份失败：${message}`;
   }

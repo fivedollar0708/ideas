@@ -736,6 +736,27 @@ body {
   font-size: 11px;
 }
 
+.sync-steps {
+  margin: 0 0 14px;
+  padding-left: 20px;
+  font-size: 12px;
+  line-height: 1.9;
+  color: var(--text-dim);
+}
+
+.sync-steps li {
+  margin-bottom: 6px;
+}
+
+.sync-steps a {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.sync-note {
+  color: var(--text-faint);
+}
+
 .sync-form {
   display: grid;
   gap: 8px;

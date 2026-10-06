@@ -80,6 +80,10 @@ const HEART_ID = '__heart__';
  */
 const DOUBLE_CLICK_GUARD_MS = 220;
 
+/** 数据镜像所在的私有仓库名（自动创建）。 */
+const DATA_REPO_NAME = 'nebula-data';
+const DEFAULT_BRANCH = 'main';
+
 function must<T extends HTMLElement>(selector: string): T {
   const el = document.querySelector<T>(selector);
   if (!el) throw new Error(`页面缺少必需的元素：${selector}`);
@@ -160,6 +164,20 @@ class App {
   /** 最近一次被"居中"的泡泡 id（自动化测试用）。 */
   private lastCenteredId: string | null = null;
 
+  /**
+   * 造远端客户端的工厂。
+   *
+   * 🔴 抽成一层是为了让自动化测试能换成内存实现 ——
+   *    "粘贴 token 之后全自动"这条路径涉及真实 GitHub 调用（/user、/user/repos），
+   *    不抽这一层就完全测不到，而它恰恰是多用户的第一步体验。
+   */
+  private remoteFactory = (opts: {
+    token: string;
+    owner: string;
+    repo: string;
+    branch: string;
+  }): GitHubClient => new GitHubClient(opts);
+
   /** 同步引擎。没有配置远端时是"纯本地"模式。 */
   private sync: SyncEngine | null = null;
   private readonly syncBar: HTMLButtonElement;
@@ -218,6 +236,8 @@ class App {
       remote: null,
       readLocal: () => this.readLocalDoc(),
       writeLocal: (doc) => this.writeLocalDoc(doc),
+      readOwnerHandle: () => this.store.getOwnerHandle(),
+      writeOwnerHandle: (handle) => this.store.setOwnerHandle(handle),
       onMerged: (report) => void this.applyMergeFeedback(report),
       onState: (snap) => this.renderSyncBar(snap),
       // 别的标签页更新了本地数据：只刷新界面，**不要再同步**（否则两个标签页会来回打）
@@ -239,9 +259,13 @@ class App {
     (layer.querySelector('#sync-now') as HTMLButtonElement).addEventListener('click', () =>
       void this.sync?.sync({ force: true }),
     );
+    (layer.querySelector('#sync-switch') as HTMLButtonElement).addEventListener('click', () =>
+      void this.switchAccount(),
+    );
     (layer.querySelector('#sync-forget') as HTMLButtonElement).addEventListener('click', () => {
       forgetSettings();
       this.sync?.setRemote(null);
+      this.sync?.setAccount(null);
       this.notice('已清除本机的备份设置（GitHub 上的数据不受影响）', 'info');
       this.closeSyncPanel();
     });
@@ -324,14 +348,19 @@ class App {
 
   private openSyncPanel(): void {
     const stored = loadStoredSettings();
-    if (stored) {
-      const set = (sel: string, value: string): void => {
-        (this.syncLayer.querySelector(sel) as HTMLInputElement).value = value;
-      };
-      set('#sync-owner', stored.target.owner);
-      set('#sync-repo', stored.target.repo);
-      set('#sync-branch', stored.target.branch);
-    }
+    const accountEl = this.syncLayer.querySelector('#sync-account') as HTMLElement;
+    const switchBtn = this.syncLayer.querySelector('#sync-switch') as HTMLButtonElement;
+
+    void this.store.getOwnerHandle().then((localOwner) => {
+      if (stored) {
+        accountEl.textContent = `已连接：@${stored.target.owner}/${stored.target.repo}（${stored.target.branch}）`;
+      } else {
+        accountEl.textContent = '';
+      }
+      // 账号不匹配时把"切换"按钮亮出来，并说明为什么停了
+      switchBtn.hidden = !(localOwner && stored && localOwner !== stored.target.owner);
+    });
+
     this.syncLayer.hidden = false;
     this.syncLayer.classList.add('layer--visible');
   }
@@ -342,58 +371,147 @@ class App {
   }
 
   /**
-   * 保存设置并同步。
+   * 从面板连接账号。
    *
-   * 两种用法共用一个按钮：
-   *  · Token 填了 ⇒ 新配置（加密后存本机）
-   *  · Token 空着但本机已有设置 ⇒ 当作"输入口令解锁"（因为密钥不落地，每次会话都要解锁一次）
+   * 用户只需要粘贴一个 token —— 其余全自动：
+   *  ① `GET /user` 问出"你是谁"（不用填 owner）
+   *  ② `POST /user/repos` 自动建私有数据仓库（不用先手动建仓）
+   * 这就是"零服务端的 GitHub 登录"能到达的最好体验。
    */
   private async applySyncPanel(): Promise<void> {
     const val = (sel: string): string =>
       (this.syncLayer.querySelector(sel) as HTMLInputElement).value.trim();
 
-    const owner = val('#sync-owner');
-    const repo = val('#sync-repo');
-    const branch = val('#sync-branch') || 'main';
     const token = val('#sync-token');
     const passphrase = val('#sync-pass');
 
     if (passphrase.length < 4) {
-      this.notice('口令至少 4 位', 'warn');
+      this.notice('本机口令至少 4 位', 'warn');
+      return;
+    }
+
+    // token 空着但本机已配过 ⇒ 当作"输入口令解锁"
+    // （派生密钥不落地，所以每次重开页面都要解锁一次）
+    if (token === '') {
+      try {
+        const unlocked = await unlockSettings(passphrase);
+        if (!unlocked) {
+          this.notice('这台设备还没有连接过，或者口令不对', 'warn');
+          return;
+        }
+        await this.connectAccount(unlocked.target, unlocked.token);
+      } catch (err) {
+        this.notice(err instanceof Error ? err.message : String(err), 'error');
+      }
       return;
     }
 
     try {
-      let resolvedToken = token;
-      if (token === '') {
-        const unlocked = await unlockSettings(passphrase);
-        if (!unlocked) {
-          this.notice('本机还没有配置，或者口令不对', 'warn');
-          return;
-        }
-        resolvedToken = unlocked.token;
-        const target = unlocked.target;
-        this.attachRemote(target.owner, target.repo, target.branch, resolvedToken);
-      } else {
-        if (owner === '' || repo === '') {
-          this.notice('仓库 owner 和仓库名都要填', 'warn');
-          return;
-        }
-        await saveSettings({ owner, repo, branch }, token, passphrase);
-        this.attachRemote(owner, repo, branch, token);
-      }
-
-      this.closeSyncPanel();
-      this.notice('正在同步…', 'info');
-      await this.sync?.sync({ force: true });
+      await this.connectWithToken(token, passphrase);
     } catch (err) {
       this.notice(err instanceof Error ? err.message : String(err), 'error');
     }
   }
 
-  private attachRemote(owner: string, repo: string, branch: string, token: string): void {
-    this.sync?.setRemote(new GitHubClient({ owner, repo, branch, token }));
+  /** 用 token 连接（面板与自动化测试共用这一条路径）。 */
+  private async connectWithToken(token: string, passphrase: string): Promise<void> {
+    this.notice('正在确认账号…', 'info');
+
+    // ① 先认人。这一步不需要 owner，所以用一个只用来问身份的临时客户端
+    const probe = this.remoteFactory({ token, owner: '', repo: '', branch: DEFAULT_BRANCH });
+    const { login } = await probe.identify();
+
+    // ② 确保私有数据仓库存在
+    const client = this.remoteFactory({
+      token,
+      owner: login,
+      repo: DATA_REPO_NAME,
+      branch: DEFAULT_BRANCH,
+    });
+    const status = await client.ensureRepo(DATA_REPO_NAME);
+
+    // 🔴 已存在的仓库如果是公开的，绝不能把私人想法写进去
+    if (!status.private) {
+      throw new Error(
+        `@${login}/${DATA_REPO_NAME} 已经存在，但是个**公开**仓库。` +
+          `为了不把你的想法公开出去，已停止。请先删掉它或改名。`,
+      );
+    }
+
+    const target = {
+      owner: login,
+      repo: DATA_REPO_NAME,
+      branch: status.defaultBranch || DEFAULT_BRANCH,
+    };
+    await saveSettings(target, token, passphrase);
+
+    this.notice(
+      status.created ? `已为 @${login} 创建私有仓库 ${DATA_REPO_NAME}` : `已连接 @${login} 的现有仓库`,
+      'info',
+    );
+    await this.connectAccount(target, token);
   }
+
+  /** 接上远端并同步。 */
+  private async connectAccount(
+    target: { owner: string; repo: string; branch: string },
+    token: string,
+  ): Promise<void> {
+    this.sync?.setAccount(target.owner);
+    this.sync?.setRemote(
+      this.remoteFactory({
+        token,
+        owner: target.owner,
+        repo: target.repo,
+        branch: target.branch,
+      }),
+    );
+
+    this.closeSyncPanel();
+    await this.sync?.sync({ force: true });
+    this.renderSyncBar(this.sync?.snapshot ?? this.syncBarText('等待同步'));
+
+    const owner = await this.store.getOwnerHandle();
+    const mismatch = this.sync?.snapshot.status === 'error' && owner && owner !== target.owner;
+    (this.syncLayer.querySelector('#sync-switch') as HTMLButtonElement).hidden = !mismatch;
+  }
+
+  private syncBarText(detail: string): SyncSnapshot {
+    return {
+      status: 'idle',
+      detail,
+      lastSyncAt: null,
+      lastError: null,
+      dirty: false,
+      lastAdded: 0,
+      lastRemoteWon: 0,
+    };
+  }
+
+  /**
+   * 切换账号。
+   *
+   * 🔴 这是多用户唯一会毁数据的操作，所以：
+   *    · 必须用户明确确认（默认对话框说明"原账号的数据在他的备份里不会丢"）
+   *    · 清空本机之后重新加载，保证没有任何残留状态
+   */
+  private async switchAccount(): Promise<void> {
+    const account = this.sync?.accountHandle ?? '（未知）';
+    const localOwner = (await this.store.getOwnerHandle()) ?? '（未知）';
+
+    const ok = window.confirm(
+      `这台设备上存的是 @${localOwner} 的数据。\n\n` +
+        `切换到 @${account} 会清空本机数据。\n` +
+        `@${localOwner} 的想法在他的 GitHub 备份里不会丢 —— 用他的账号登录就能取回。\n\n` +
+        `确定切换？`,
+    );
+    if (!ok) return;
+
+    await this.store.wipeAllData();
+    // 重新加载最稳：不会有任何旧状态残留
+    location.reload();
+  }
+
 
   // ── 搜索：聚光，不是清场 ──────────────────────────────
 
@@ -1453,6 +1571,19 @@ class App {
        *    这样才能把"会毁数据"的那几条路径真正跑一遍。
        */
       installRemote: (store: unknown) => this.sync?.setRemote(store as never),
+      /** 告知引擎这份凭据属于哪个账号（测试用）。 */
+      setAccount: (handle: string | null) => this.sync?.setAccount(handle),
+      /** 本机数据的主人。 */
+      ownerHandle: () => this.store.getOwnerHandle(),
+      /** 走完整的"用 token 连接"流程（与面板同一条路径）。 */
+      connectWithToken: (token: string, passphrase: string) =>
+        this.connectWithToken(token, passphrase),
+      /** 清空本机数据（切换账号用，测试里直接调）。 */
+      wipeLocal: () => this.store.wipeAllData(),
+      /** 替换远端客户端工厂（测试注入内存实现）。 */
+      setRemoteFactory: (fn: unknown) => {
+        this.remoteFactory = fn as typeof this.remoteFactory;
+      },
 
       /** 把待写回的位置立刻落库（测试与关页面前用）。 */
       flushPositions: () => this.flushPositions(true),

@@ -31,6 +31,14 @@ export const META_SCHEMA_VERSION = 'schemaVersion';
  * 同步时它会跟着推到镜像，用来堵住"清掉的东西下次同步又冒回来"。
  */
 export const META_PURGED_IDS = 'purgedIds';
+/**
+ * 本机这份数据的**主人**（GitHub 用户名）。
+ *
+ * 🔴 多用户最容易出事故的地方：A 在这台电脑上用过，B 再登录 ——
+ *    合并是并集语义，于是 A 的私人想法会被推到 B 的仓库里。
+ *    所以每次同步前都要核对这个值，不一致就拒绝同步。
+ */
+export const META_OWNER_HANDLE = 'ownerHandle';
 export const viewportKey = (spaceId: Id): string => `viewport:${spaceId}`;
 
 interface MetaRecord {
@@ -327,6 +335,32 @@ export class NebulaStore {
 
   setViewport(spaceId: Id, vp: Viewport): Promise<void> {
     return this.setMeta(viewportKey(spaceId), vp);
+  }
+
+  /** 本机数据的主人（GitHub 用户名）。null = 还没归属过任何账号。 */
+  async getOwnerHandle(): Promise<string | null> {
+    const value = await this.getMeta<string>(META_OWNER_HANDLE);
+    return typeof value === 'string' && value !== '' ? value : null;
+  }
+
+  async setOwnerHandle(handle: string): Promise<void> {
+    await this.setMeta(META_OWNER_HANDLE, handle);
+  }
+
+  /**
+   * 清空本机全部数据。
+   *
+   * 🔴 只在一件事上用它：**切换账号**。
+   *    必须由用户明确确认（界面会弹确认框并说明"原账号的数据在他的备份里不会丢"），
+   *    因为这一步之后，本机就再也看不到原来那个账号的数据了。
+   */
+  wipeAllData(): Promise<void> {
+    return this.write([STORE_SPACES, STORE_IDEAS, STORE_TRASH, STORE_META], (tx) => {
+      tx.objectStore(STORE_SPACES).clear();
+      tx.objectStore(STORE_IDEAS).clear();
+      tx.objectStore(STORE_TRASH).clear();
+      tx.objectStore(STORE_META).clear();
+    });
   }
 
   /** 已被彻底清理的 id（空间与想法混合）。 */

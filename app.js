@@ -1062,6 +1062,7 @@
   var STORE_TRASH = "trash";
   var META_LAST_SPACE_ID = "lastSpaceId";
   var META_PURGED_IDS = "purgedIds";
+  var META_OWNER_HANDLE = "ownerHandle";
   var viewportKey = (spaceId) => `viewport:${spaceId}`;
   function nextSpaceName(taken) {
     for (let n = 1; n <= 999; n++) {
@@ -1294,6 +1295,29 @@
     }
     setViewport(spaceId, vp) {
       return this.setMeta(viewportKey(spaceId), vp);
+    }
+    /** 本机数据的主人（GitHub 用户名）。null = 还没归属过任何账号。 */
+    async getOwnerHandle() {
+      const value = await this.getMeta(META_OWNER_HANDLE);
+      return typeof value === "string" && value !== "" ? value : null;
+    }
+    async setOwnerHandle(handle) {
+      await this.setMeta(META_OWNER_HANDLE, handle);
+    }
+    /**
+     * 清空本机全部数据。
+     *
+     * 🔴 只在一件事上用它：**切换账号**。
+     *    必须由用户明确确认（界面会弹确认框并说明"原账号的数据在他的备份里不会丢"），
+     *    因为这一步之后，本机就再也看不到原来那个账号的数据了。
+     */
+    wipeAllData() {
+      return this.write([STORE_SPACES, STORE_IDEAS, STORE_TRASH, STORE_META], (tx) => {
+        tx.objectStore(STORE_SPACES).clear();
+        tx.objectStore(STORE_IDEAS).clear();
+        tx.objectStore(STORE_TRASH).clear();
+        tx.objectStore(STORE_META).clear();
+      });
     }
     /** 已被彻底清理的 id（空间与想法混合）。 */
     async getPurgedIds() {
@@ -1620,6 +1644,56 @@
       }
       if (!res.ok) await this.fail(res);
     }
+    /**
+     * 问 GitHub"我是谁"。
+     *
+     * 🔴 这一步让用户**不用手填 owner** —— 有 token 就知道了。
+     *    多用户的第一条体验优化就是它：少填一个字段，少一次填错的机会。
+     */
+    async identify() {
+      const res = await fetchWithTimeout("https://api.github.com/user", {
+        headers: this.headers()
+      });
+      if (!res.ok) await this.fail(res);
+      const data = await res.json();
+      if (typeof data.login !== "string" || data.login === "") {
+        throw new SyncError("content", "GitHub \u7684 /user \u6CA1\u6709\u8FD4\u56DE login\uFF0C\u65E0\u6CD5\u786E\u8BA4\u8D26\u53F7");
+      }
+      return { login: data.login };
+    }
+    /**
+     * 确保数据仓库存在。
+     *
+     * 🔴 已存在时**不改动它**，只回报它的可见性 —— 由调用方决定要不要拒绝。
+     *    如果用户手上已经有一个同名的公开仓库，我们绝不能把私人想法写进去。
+     */
+    async ensureRepo(name) {
+      const head = await fetchWithTimeout(
+        `https://api.github.com/repos/${this.opts.owner}/${name}`,
+        { headers: this.headers() }
+      );
+      if (head.ok) {
+        const data = await head.json();
+        return {
+          created: false,
+          private: data.private === true,
+          defaultBranch: typeof data.default_branch === "string" ? data.default_branch : void 0
+        };
+      }
+      if (head.status !== 404) await this.fail(head);
+      const create = await fetchWithTimeout("https://api.github.com/user/repos", {
+        method: "POST",
+        headers: { ...this.headers(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          private: true,
+          auto_init: false,
+          description: "\u60F3\u6CD5\u661F\u4E91\u7684\u6570\u636E\u955C\u50CF\uFF08\u79C1\u6709\uFF09"
+        })
+      });
+      if (!create.ok) await this.fail(create);
+      return { created: true, private: true, defaultBranch: this.opts.branch };
+    }
     /** 读一个文件、取它的文本；不存在返回 null。 */
     async tryReadText(path) {
       const file = await this.readFile(path);
@@ -1836,6 +1910,11 @@
       savedAt: now
     };
   }
+  function ownerVerdict(localOwner, account) {
+    if (!account) return "ok";
+    if (!localOwner) return "first-time";
+    return localOwner === account ? "ok" : "mismatch";
+  }
   var SYNC_KINDS = /* @__PURE__ */ new Set([
     "auth",
     "notfound",
@@ -1880,10 +1959,19 @@
     timer = 0;
     running = false;
     channel = null;
+    /** 当前远端凭据对应的账号（由上层在配置时通过 setAccount 告知）。 */
+    account = null;
     /** 上一次成功写进 backup 的内容，用来避免"内容没变也产生一个 commit"。 */
     lastBackupBody = null;
     get snapshot() {
       return this.snapshotValue;
+    }
+    /** 告知引擎"这份凭据是谁的"。做账号守卫要用。 */
+    setAccount(handle) {
+      this.account = handle;
+    }
+    get accountHandle() {
+      return this.account;
     }
     setRemote(remote) {
       this.deps = { ...this.deps, remote };
@@ -1931,6 +2019,14 @@
     async runOnce(remote, force) {
       this.patch({ status: "pulling", detail: "\u6B63\u5728\u540C\u6B65\u2026", lastError: null });
       try {
+        const localOwner = await this.deps.readOwnerHandle();
+        const verdict = ownerVerdict(localOwner, this.account);
+        if (verdict === "mismatch") {
+          throw new SyncError(
+            "owner-mismatch",
+            `\u8FD9\u53F0\u8BBE\u5907\u4E0A\u7684\u6570\u636E\u5C5E\u4E8E @${localOwner}\uFF0C\u800C\u5F53\u524D\u8D26\u53F7\u662F @${this.account}\u3002\u4E3A\u4E86\u4E0D\u628A @${localOwner} \u7684\u60F3\u6CD5\u63A8\u5230 @${this.account} \u7684\u4ED3\u5E93\u91CC\uFF0C\u540C\u6B65\u5DF2\u505C\u6B62\u3002`
+          );
+        }
         let config = defaultConfig();
         const configFile = await remote.readFile(CONFIG_PATH);
         if (configFile) {
@@ -1962,6 +2058,9 @@
           } else {
             remoteDoc = emptyDoc();
           }
+        }
+        if (verdict === "first-time" && this.account) {
+          await this.deps.writeOwnerHandle(this.account);
         }
         const localDoc = await this.deps.readLocal();
         const merged = mergeDocs(localDoc, remoteDoc);
@@ -2018,7 +2117,7 @@
         this.lastPushAt = Date.now();
         this.patch({
           status: "idle",
-          detail: `\u5DF2\u5907\u4EFD \xB7 ${(/* @__PURE__ */ new Date()).toLocaleTimeString("zh-CN", { hour12: false })}`,
+          detail: `@${this.account ?? ""} \u5DF2\u5907\u4EFD \xB7 ${(/* @__PURE__ */ new Date()).toLocaleTimeString("zh-CN", { hour12: false })}`,
           lastSyncAt: Date.now(),
           dirty: false,
           lastError: null,
@@ -2095,6 +2194,8 @@
         return "\u5907\u4EFD\u5931\u8D25\uFF1A\u8FDC\u7AEF\u5185\u5BB9\u5F02\u5E38 \xB7 \u5DF2\u505C\u6B62\u540C\u6B65\u4EE5\u4FDD\u62A4\u672C\u5730\u6570\u636E";
       case "conflict":
         return "\u5907\u4EFD\u5931\u8D25\uFF1A\u7248\u672C\u51B2\u7A81 \xB7 \u4F1A\u91CD\u8BD5";
+      case "owner-mismatch":
+        return "\u672C\u673A\u6570\u636E\u5C5E\u4E8E\u53E6\u4E00\u4E2A\u8D26\u53F7 \xB7 \u70B9\u6B64\u5904\u7406";
       default:
         return `\u5907\u4EFD\u5931\u8D25\uFF1A${message}`;
     }
@@ -2751,6 +2852,8 @@
   // src/main.ts
   var HEART_ID = "__heart__";
   var DOUBLE_CLICK_GUARD_MS = 220;
+  var DATA_REPO_NAME = "nebula-data";
+  var DEFAULT_BRANCH = "main";
   function must(selector) {
     const el = document.querySelector(selector);
     if (!el) throw new Error(`\u9875\u9762\u7F3A\u5C11\u5FC5\u9700\u7684\u5143\u7D20\uFF1A${selector}`);
@@ -2808,6 +2911,14 @@
     viewportAnim = 0;
     /** 最近一次被"居中"的泡泡 id（自动化测试用）。 */
     lastCenteredId = null;
+    /**
+     * 造远端客户端的工厂。
+     *
+     * 🔴 抽成一层是为了让自动化测试能换成内存实现 ——
+     *    "粘贴 token 之后全自动"这条路径涉及真实 GitHub 调用（/user、/user/repos），
+     *    不抽这一层就完全测不到，而它恰恰是多用户的第一步体验。
+     */
+    remoteFactory = (opts) => new GitHubClient(opts);
     /** 同步引擎。没有配置远端时是"纯本地"模式。 */
     sync = null;
     syncBar;
@@ -2856,6 +2967,8 @@
         remote: null,
         readLocal: () => this.readLocalDoc(),
         writeLocal: (doc) => this.writeLocalDoc(doc),
+        readOwnerHandle: () => this.store.getOwnerHandle(),
+        writeOwnerHandle: (handle) => this.store.setOwnerHandle(handle),
         onMerged: (report) => void this.applyMergeFeedback(report),
         onState: (snap) => this.renderSyncBar(snap),
         // 别的标签页更新了本地数据：只刷新界面，**不要再同步**（否则两个标签页会来回打）
@@ -2879,9 +2992,14 @@
         "click",
         () => void this.sync?.sync({ force: true })
       );
+      layer.querySelector("#sync-switch").addEventListener(
+        "click",
+        () => void this.switchAccount()
+      );
       layer.querySelector("#sync-forget").addEventListener("click", () => {
         forgetSettings();
         this.sync?.setRemote(null);
+        this.sync?.setAccount(null);
         this.notice("\u5DF2\u6E05\u9664\u672C\u673A\u7684\u5907\u4EFD\u8BBE\u7F6E\uFF08GitHub \u4E0A\u7684\u6570\u636E\u4E0D\u53D7\u5F71\u54CD\uFF09", "info");
         this.closeSyncPanel();
       });
@@ -2952,14 +3070,16 @@
     }
     openSyncPanel() {
       const stored = loadStoredSettings();
-      if (stored) {
-        const set = (sel, value) => {
-          this.syncLayer.querySelector(sel).value = value;
-        };
-        set("#sync-owner", stored.target.owner);
-        set("#sync-repo", stored.target.repo);
-        set("#sync-branch", stored.target.branch);
-      }
+      const accountEl = this.syncLayer.querySelector("#sync-account");
+      const switchBtn = this.syncLayer.querySelector("#sync-switch");
+      void this.store.getOwnerHandle().then((localOwner) => {
+        if (stored) {
+          accountEl.textContent = `\u5DF2\u8FDE\u63A5\uFF1A@${stored.target.owner}/${stored.target.repo}\uFF08${stored.target.branch}\uFF09`;
+        } else {
+          accountEl.textContent = "";
+        }
+        switchBtn.hidden = !(localOwner && stored && localOwner !== stored.target.owner);
+      });
       this.syncLayer.hidden = false;
       this.syncLayer.classList.add("layer--visible");
     }
@@ -2968,51 +3088,119 @@
       this.syncLayer.hidden = true;
     }
     /**
-     * 保存设置并同步。
+     * 从面板连接账号。
      *
-     * 两种用法共用一个按钮：
-     *  · Token 填了 ⇒ 新配置（加密后存本机）
-     *  · Token 空着但本机已有设置 ⇒ 当作"输入口令解锁"（因为密钥不落地，每次会话都要解锁一次）
+     * 用户只需要粘贴一个 token —— 其余全自动：
+     *  ① `GET /user` 问出"你是谁"（不用填 owner）
+     *  ② `POST /user/repos` 自动建私有数据仓库（不用先手动建仓）
+     * 这就是"零服务端的 GitHub 登录"能到达的最好体验。
      */
     async applySyncPanel() {
       const val = (sel) => this.syncLayer.querySelector(sel).value.trim();
-      const owner = val("#sync-owner");
-      const repo = val("#sync-repo");
-      const branch = val("#sync-branch") || "main";
       const token = val("#sync-token");
       const passphrase = val("#sync-pass");
       if (passphrase.length < 4) {
-        this.notice("\u53E3\u4EE4\u81F3\u5C11 4 \u4F4D", "warn");
+        this.notice("\u672C\u673A\u53E3\u4EE4\u81F3\u5C11 4 \u4F4D", "warn");
+        return;
+      }
+      if (token === "") {
+        try {
+          const unlocked = await unlockSettings(passphrase);
+          if (!unlocked) {
+            this.notice("\u8FD9\u53F0\u8BBE\u5907\u8FD8\u6CA1\u6709\u8FDE\u63A5\u8FC7\uFF0C\u6216\u8005\u53E3\u4EE4\u4E0D\u5BF9", "warn");
+            return;
+          }
+          await this.connectAccount(unlocked.target, unlocked.token);
+        } catch (err) {
+          this.notice(err instanceof Error ? err.message : String(err), "error");
+        }
         return;
       }
       try {
-        let resolvedToken = token;
-        if (token === "") {
-          const unlocked = await unlockSettings(passphrase);
-          if (!unlocked) {
-            this.notice("\u672C\u673A\u8FD8\u6CA1\u6709\u914D\u7F6E\uFF0C\u6216\u8005\u53E3\u4EE4\u4E0D\u5BF9", "warn");
-            return;
-          }
-          resolvedToken = unlocked.token;
-          const target = unlocked.target;
-          this.attachRemote(target.owner, target.repo, target.branch, resolvedToken);
-        } else {
-          if (owner === "" || repo === "") {
-            this.notice("\u4ED3\u5E93 owner \u548C\u4ED3\u5E93\u540D\u90FD\u8981\u586B", "warn");
-            return;
-          }
-          await saveSettings({ owner, repo, branch }, token, passphrase);
-          this.attachRemote(owner, repo, branch, token);
-        }
-        this.closeSyncPanel();
-        this.notice("\u6B63\u5728\u540C\u6B65\u2026", "info");
-        await this.sync?.sync({ force: true });
+        await this.connectWithToken(token, passphrase);
       } catch (err) {
         this.notice(err instanceof Error ? err.message : String(err), "error");
       }
     }
-    attachRemote(owner, repo, branch, token) {
-      this.sync?.setRemote(new GitHubClient({ owner, repo, branch, token }));
+    /** 用 token 连接（面板与自动化测试共用这一条路径）。 */
+    async connectWithToken(token, passphrase) {
+      this.notice("\u6B63\u5728\u786E\u8BA4\u8D26\u53F7\u2026", "info");
+      const probe = this.remoteFactory({ token, owner: "", repo: "", branch: DEFAULT_BRANCH });
+      const { login } = await probe.identify();
+      const client = this.remoteFactory({
+        token,
+        owner: login,
+        repo: DATA_REPO_NAME,
+        branch: DEFAULT_BRANCH
+      });
+      const status = await client.ensureRepo(DATA_REPO_NAME);
+      if (!status.private) {
+        throw new Error(
+          `@${login}/${DATA_REPO_NAME} \u5DF2\u7ECF\u5B58\u5728\uFF0C\u4F46\u662F\u4E2A**\u516C\u5F00**\u4ED3\u5E93\u3002\u4E3A\u4E86\u4E0D\u628A\u4F60\u7684\u60F3\u6CD5\u516C\u5F00\u51FA\u53BB\uFF0C\u5DF2\u505C\u6B62\u3002\u8BF7\u5148\u5220\u6389\u5B83\u6216\u6539\u540D\u3002`
+        );
+      }
+      const target = {
+        owner: login,
+        repo: DATA_REPO_NAME,
+        branch: status.defaultBranch || DEFAULT_BRANCH
+      };
+      await saveSettings(target, token, passphrase);
+      this.notice(
+        status.created ? `\u5DF2\u4E3A @${login} \u521B\u5EFA\u79C1\u6709\u4ED3\u5E93 ${DATA_REPO_NAME}` : `\u5DF2\u8FDE\u63A5 @${login} \u7684\u73B0\u6709\u4ED3\u5E93`,
+        "info"
+      );
+      await this.connectAccount(target, token);
+    }
+    /** 接上远端并同步。 */
+    async connectAccount(target, token) {
+      this.sync?.setAccount(target.owner);
+      this.sync?.setRemote(
+        this.remoteFactory({
+          token,
+          owner: target.owner,
+          repo: target.repo,
+          branch: target.branch
+        })
+      );
+      this.closeSyncPanel();
+      await this.sync?.sync({ force: true });
+      this.renderSyncBar(this.sync?.snapshot ?? this.syncBarText("\u7B49\u5F85\u540C\u6B65"));
+      const owner = await this.store.getOwnerHandle();
+      const mismatch = this.sync?.snapshot.status === "error" && owner && owner !== target.owner;
+      this.syncLayer.querySelector("#sync-switch").hidden = !mismatch;
+    }
+    syncBarText(detail) {
+      return {
+        status: "idle",
+        detail,
+        lastSyncAt: null,
+        lastError: null,
+        dirty: false,
+        lastAdded: 0,
+        lastRemoteWon: 0
+      };
+    }
+    /**
+     * 切换账号。
+     *
+     * 🔴 这是多用户唯一会毁数据的操作，所以：
+     *    · 必须用户明确确认（默认对话框说明"原账号的数据在他的备份里不会丢"）
+     *    · 清空本机之后重新加载，保证没有任何残留状态
+     */
+    async switchAccount() {
+      const account = this.sync?.accountHandle ?? "\uFF08\u672A\u77E5\uFF09";
+      const localOwner = await this.store.getOwnerHandle() ?? "\uFF08\u672A\u77E5\uFF09";
+      const ok = window.confirm(
+        `\u8FD9\u53F0\u8BBE\u5907\u4E0A\u5B58\u7684\u662F @${localOwner} \u7684\u6570\u636E\u3002
+
+\u5207\u6362\u5230 @${account} \u4F1A\u6E05\u7A7A\u672C\u673A\u6570\u636E\u3002
+@${localOwner} \u7684\u60F3\u6CD5\u5728\u4ED6\u7684 GitHub \u5907\u4EFD\u91CC\u4E0D\u4F1A\u4E22 \u2014\u2014 \u7528\u4ED6\u7684\u8D26\u53F7\u767B\u5F55\u5C31\u80FD\u53D6\u56DE\u3002
+
+\u786E\u5B9A\u5207\u6362\uFF1F`
+      );
+      if (!ok) return;
+      await this.store.wipeAllData();
+      location.reload();
     }
     // ── 搜索：聚光，不是清场 ──────────────────────────────
     bindSearch() {
@@ -3861,6 +4049,18 @@
          *    这样才能把"会毁数据"的那几条路径真正跑一遍。
          */
         installRemote: (store) => this.sync?.setRemote(store),
+        /** 告知引擎这份凭据属于哪个账号（测试用）。 */
+        setAccount: (handle) => this.sync?.setAccount(handle),
+        /** 本机数据的主人。 */
+        ownerHandle: () => this.store.getOwnerHandle(),
+        /** 走完整的"用 token 连接"流程（与面板同一条路径）。 */
+        connectWithToken: (token, passphrase) => this.connectWithToken(token, passphrase),
+        /** 清空本机数据（切换账号用，测试里直接调）。 */
+        wipeLocal: () => this.store.wipeAllData(),
+        /** 替换远端客户端工厂（测试注入内存实现）。 */
+        setRemoteFactory: (fn) => {
+          this.remoteFactory = fn;
+        },
         /** 把待写回的位置立刻落库（测试与关页面前用）。 */
         flushPositions: () => this.flushPositions(true),
         /**

@@ -120,7 +120,10 @@ async function evaluate(cdp, expression) {
     awaitPromise: true,
   });
   if (result.exceptionDetails) {
-    throw new Error(`页面内求值抛错：${result.exceptionDetails.text}`);
+    // 把异常详情带出来 —— 只写 "Uncaught" 对定位毫无帮助
+    const d = result.exceptionDetails;
+    const desc = d.exception?.description ?? d.exception?.value ?? d.text ?? '未知异常';
+    throw new Error(`页面内求值抛错：${String(desc).split('\n')[0]}`);
   }
   return result.result?.value;
 }
@@ -1432,7 +1435,17 @@ async function main() {
           let mode = 'ok';
           const persist = () => localStorage.setItem(KEY, JSON.stringify(Object.fromEntries(files)));
           const mkErr = (kind, msg) => Object.assign(new Error(msg), { kind, name: 'SyncError' });
+          let account = 'mockuser';
           const store = {
+            async identify() {
+              if (mode === 'auth') throw mkErr('auth', '凭据无效（401）');
+              return { login: account };
+            },
+            async ensureRepo() {
+              if (mode === 'auth') throw mkErr('auth', '凭据无效（401）');
+              return { created: files.size === 0, private: true, defaultBranch: 'main' };
+            },
+            setAccount: (h) => { account = h; },
             async readFile(path) {
               if (mode === 'auth') throw mkErr('auth', '凭据无效（401）：Bad credentials');
               if (mode === 'network') throw mkErr('network', '请求失败：Failed to fetch');
@@ -1453,6 +1466,7 @@ async function main() {
           };
           window.__mock = {
             store,
+            setAccount: (h) => { account = h; },
             writes: () => writes,
             setMode: (m) => { mode = m; },
             read: (p) => (files.get(p) ? files.get(p).text : null),
@@ -1623,6 +1637,72 @@ async function main() {
     ok(
       restoredDoc.ideas.length >= expectedCount,
       `🔴 演练5：清空本地后从备份完整恢复（${restoredDoc.ideas.length} 条，期望 ≥ ${expectedCount}）`,
+    );
+
+    console.log('\n── 多用户演练（每人一个账号、一个私有仓库） ──');
+
+    // 演练10：粘贴 token 之后全自动（认人 + 建仓 + 首次同步）
+    await evaluate(cdp, `window.__nebula.setRemoteFactory(() => window.__mock.store)`);
+    await evaluate(cdp, `window.__mock.reset()`);
+    await evaluate(cdp, `window.__nebula.wipeLocal()`);
+    await sleep(300);
+
+    await evaluate(cdp, `window.__mock.setAccount('alice')`);
+    await evaluate(cdp, `window.__nebula.connectWithToken('ghp_fake_token', 'pass1234')`);
+    await sleep(1500);
+
+    ok(
+      (await evaluate(cdp, `window.__nebula.ownerHandle()`)) === 'alice',
+      '演练10：粘贴 token 后自动识别账号（不用手填 owner）',
+      String(await evaluate(cdp, `window.__nebula.ownerHandle()`)),
+    );
+    ok(
+      await evaluate(cdp, `window.__mock.read('data/sync.config.json') !== null`),
+      '演练10：自动创建了私有数据仓库并写入 config（不用先手动建仓）',
+    );
+
+    // 在 alice 的账号下记两条
+    await typeAndEnter(cdp, 'alice 的第一条想法');
+    await typeAndEnter(cdp, 'alice 的第二条想法');
+    await evaluate(cdp, `window.__nebula.syncDirty()`);
+    await runSync(1000);
+    const aliceRemote = JSON.parse(await evaluate(cdp, `window.__mock.read('data/ideas.json')`));
+    ok(aliceRemote.ideas.length === 2, `演练10：alice 的 2 条已经备份（${aliceRemote.ideas.length} 条）`);
+
+    // ── 🔴 演练11：同一台电脑换一个人登录 ──
+    await evaluate(cdp, `window.__mock.reset()`);
+    await evaluate(cdp, `window.__nebula.setAccount('bob')`);
+    await evaluate(cdp, `window.__nebula.syncDirty()`);
+    await runSync(800);
+
+    const guardState = await evaluate(cdp, `window.__nebula.syncState()`);
+    ok(
+      guardState.status === 'error' && /另一个账号|属于/.test(guardState.detail),
+      `🔴 演练11：换账号后同步被拦下（${guardState.detail}）`,
+    );
+    const leaked = await evaluate(cdp, `window.__mock.read('data/ideas.json')`);
+    ok(
+      leaked === null,
+      '🔴 演练11：alice 的想法一条都没被推到 bob 的仓库（跨账号泄漏已堵住）',
+      String(leaked).slice(0, 120),
+    );
+    const localStill = await readLocalNow();
+    ok(
+      localStill.ideas.length === 2,
+      '演练11：本地数据完好，没有被清掉（拦下是"不动"，不是"删掉"）',
+      String(localStill.ideas.length),
+    );
+
+    // ── 演练12：用户确认切换 ⇒ 清空本机后正常归属新账号 ──
+    await evaluate(cdp, `window.__nebula.wipeLocal()`);
+    await sleep(300);
+    await evaluate(cdp, `window.__nebula.syncNow(true)`);
+    await sleep(1200);
+    const afterSwitch = await evaluate(cdp, `window.__nebula.ownerHandle()`);
+    ok(afterSwitch === 'bob', `演练12：清空本机后正常归属到新账号（@${afterSwitch}）`);
+    ok(
+      (await readLocalNow()).ideas.length === 0,
+      '演练12：新账号从零开始（alice 的数据不在本机了，但在她的备份里）',
     );
   } finally {
     try {

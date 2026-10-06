@@ -52,31 +52,36 @@
 <div id="sync-layer" class="layer" hidden>
   <div class="layer-backdrop"></div>
   <div class="layer-panel" role="dialog" aria-label="备份设置">
-    <h2 class="layer-title">备份设置</h2>
+    <h2 class="layer-title">连接 GitHub 备份</h2>
     <p class="sync-warn">
-      想法会备份到你的 GitHub 仓库。<strong>仓库必须是私有的</strong> ——
-      公开仓库里的 <code>data/ideas.json</code> 任何人都能看到。
+      🔒 你的想法存在<strong>你自己的私有 GitHub 仓库</strong>里 —— 不经过任何服务器，
+      也没有别人能看到。<br>
+      每个人用自己的 GitHub 账号，就得到自己独立的一片星空。
     </p>
+
+    <ol class="sync-steps">
+      <li>
+        点这个链接去生成 token（<strong>权限已经预填好了</strong>）：
+        <a id="sync-token-link" href="https://github.com/settings/tokens/new?scopes=repo"
+           target="_blank" rel="noopener noreferrer">打开 GitHub 生成 token →</a><br>
+        <span class="sync-note">页面拉到最后点绿色的 <strong>Generate token</strong> 就行。</span>
+      </li>
+      <li>复制那串以 <code>ghp_</code> 或 <code>github_pat_</code> 开头的字符</li>
+      <li>粘到下面，设一个本机口令（至少 4 位），点「连接并备份」</li>
+    </ol>
+
     <div class="sync-form">
-      <label class="sync-field"><span>仓库 owner</span>
-        <input id="sync-owner" type="text" autocomplete="off" placeholder="fivedollar0708"></label>
-      <label class="sync-field"><span>仓库名</span>
-        <input id="sync-repo" type="text" autocomplete="off" placeholder="nebula-data"></label>
-      <label class="sync-field"><span>分支</span>
-        <input id="sync-branch" type="text" autocomplete="off" placeholder="main"></label>
       <label class="sync-field"><span>Token</span>
-        <input id="sync-token" type="password" autocomplete="off" placeholder="github_pat_…"></label>
+        <input id="sync-token" type="password" autocomplete="off" placeholder="ghp_…"></label>
       <label class="sync-field"><span>本机口令</span>
         <input id="sync-pass" type="password" autocomplete="off" placeholder="至少 4 位"></label>
     </div>
-    <p class="sync-hint">
-      口令用来加密 token 后再存到本机，密钥不落地 —— 所以每次重开页面要重新输入。
-      Token 只勾这一个仓库的 Contents 读写权限，🔴 千万不要勾 Workflows。
-    </p>
+    <p id="sync-account" class="sync-hint"></p>
     <div class="layer-actions">
       <button id="sync-save" class="btn" type="button">保存并同步</button>
       <button id="sync-now" class="btn" type="button">立即同步</button>
-      <button id="sync-forget" class="btn btn--danger" type="button">清除设置</button>
+      <button id="sync-switch" class="btn btn--danger" type="button" hidden>清空本机并切换到此账号</button>
+      <button id="sync-forget" class="btn btn--danger" type="button">断开备份</button>
       <button id="sync-close" class="btn" type="button">关闭</button>
     </div>
   </div>
