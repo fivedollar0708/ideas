@@ -20,11 +20,16 @@
 
 ## 1. 新会话开场怎么做
 
+> 📌 **CLI 代理（Codex 等）会自动读仓库根目录的 `AGENTS.md`** —— 那份是给代理的指令，
+> 里面已经有硬约束、命令、验证纪律与工作协议。**用 Codex 的话直接开工即可**，
+> 它会自己读到。下面这套是给"没有自动读 AGENTS.md 的对话式 AI"用的。
+
 ```
 ① 读 HANDOFF.md（这份）—— 现状、锁定的决策、硬约束、待办
-② 读 PROJECT-SPEC.md 的 §1（目标与范围）+ §3（交互）+ §4（数据模型）
-③ 如果要做某个具体阶段，再读 AI-PROMPTS.md 里对应的那一段
-④ 说要做什么
+② 读 PITFALLS.md —— 历史踩坑（动手前扫一遍，能省掉一整轮返工）
+③ 读 PROJECT-SPEC.md 的 §1（目标与范围）+ §3（交互）+ §4（数据模型）
+④ 如果要做某个具体阶段，再读 AI-PROMPTS.md 里对应的那一段
+⑤ 说要做什么
 ```
 
 **不要**让 AI 重新设计已经定下来的东西 —— 第 3 节列的决策都是反复权衡过的，推翻会牵连一大片。
@@ -207,12 +212,18 @@ readLocalDoc / installRemote / setRemoteFactory 等，冒烟测试全靠它。
 
 | 文件 | 管什么 | 什么时候读 |
 |---|---|---|
-| **`HANDOFF.md`**（这份） | **现状**：锁定的决策、硬约束、待办、坑 | 新会话第一份 |
+| **`AGENTS.md`** | **给 CLI 代理的项目指令**（硬约束、命令、验证纪律、工作协议） | Codex 等会自动读，人也可以先扫一遍 |
+| **`HANDOFF.md`**（这份） | **现状**：锁定的决策、硬约束、待办 | 新会话第一份 |
+| **`PITFALLS.md`** | **历史踩坑清单**（症状 → 根因 → 修法，25 条） | 动手改代码前 |
 | `PROJECT-SPEC.md` | **设计意图**：目标、交互细节、数据模型、关键流程 | 要改交互或数据模型时 |
 | `AI-PROMPTS.md` | 分阶段提示词模板 + 全局约定速查 | 要做某个阶段时 |
 | `SYNC-DRILLS.md` | 真实仓库上的 12 条同步演练，逐步操作手册 | 动同步模块前 / 验收时 |
 | `README.md` | 给使用者看的（含数据恢复手册） | 收尾阶段要补 |
 
-另外两处不在仓库里但很重要：
-- 技能 `~/.workbuddy/skills/nebula-stage/SKILL.md` —— 阶段地图 + 按编号的历史踩坑清单
-- 工作记忆 `C:/Users/fived/Desktop/ideas/.workbuddy/memory/2026-10-05.md` —— 每个阶段的验收数字与决策记录
+另外两处**不在仓库里**（换工具或换机器时会丢，所以关键内容已经搬进 `PITFALLS.md` 和
+这份 `HANDOFF.md`）：
+- 技能 `~/.workbuddy/skills/nebula-stage/SKILL.md` —— 用 WorkBuddy 时自动加载
+- 工作记忆 `.workbuddy/memory/2026-10-05.md` —— 每个阶段的验收数字与决策记录（很详细）
+
+> ⚠️ 这两处 Codex 读不到（`.workbuddy/` 也被 gitignore 排除了）。
+> **凡是 Codex 需要知道的，都在 `AGENTS.md` / `HANDOFF.md` / `PITFALLS.md` 里。**
