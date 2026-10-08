@@ -181,6 +181,7 @@ function spawnRipple(at: Vec): void {
 
 /** 一次飞行的几何记录，供自动化测试核对"影子落点 == 真泡泡落点"。 */
 export interface FlightRecord {
+  mode: 'arc' | 'fade';
   from: Vec;
   control: Vec;
   to: Vec;
@@ -203,6 +204,7 @@ export function getLastFlight(): FlightRecord | null {
 }
 
 export interface FlyInRequest {
+  ripple?: boolean;
   text: string;
   /** 起点：输入框中心（视口坐标）。 */
   from: Vec;
@@ -225,25 +227,25 @@ export async function flyIn(req: FlyInRequest): Promise<FlightRecord> {
     req.lift ?? ARC_LIFT_MIN + (ARC_LIFT_MAX - ARC_LIFT_MIN) * 0.5;
   const control = arcControlPoint(from, to, lift);
 
-  const record: FlightRecord = { from, control, to, shadowEnd: null, landedAt: null };
+  const reduced = prefersReducedMotion();
+  const record: FlightRecord = { mode: reduced ? 'fade' : 'arc', from, control, to, shadowEnd: null, landedAt: null };
   lastFlight = record;
-
-  // 系统要求减少动态效果 ⇒ 不发弧线，只留涟漪
-  if (prefersReducedMotion()) {
-    spawnRipple(to);
-    record.shadowEnd = { ...to };
-    return record;
-  }
 
   const layer = ensureFxLayer();
   const shadow = buildShadow(text, rx, ry);
-  shadow.style.offsetPath = pathDataFor(from, control, to);
+  if (reduced) {
+    shadow.style.transform = `translate(${to.x}px, ${to.y}px)`;
+    shadow.style.marginLeft = `${-rx}px`;
+    shadow.style.marginTop = `${-ry}px`;
+  } else {
+    shadow.style.offsetPath = pathDataFor(from, control, to);
+  }
   layer.appendChild(shadow);
 
   const anim = shadow.animate(
-    [{ offsetDistance: '0%' }, { offsetDistance: '100%' }],
+    reduced ? [{ opacity: '0' }, { opacity: '1' }] : [{ offsetDistance: '0%' }, { offsetDistance: '100%' }],
     {
-      duration: FLY_MS,
+      duration: reduced ? 140 : FLY_MS,
       easing: 'cubic-bezier(.3,.1,.35,1)',
       // 🔴 必须 fill: 'forwards'。默认的 'none' 会在动画一结束就把 offset-distance
       //    弹回基础值（0%），于是"影子已经飞到了"这件事在测量时根本看不到 ——
@@ -264,7 +266,7 @@ export async function flyIn(req: FlyInRequest): Promise<FlightRecord> {
   record.shadowEnd = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
 
   shadow.remove();
-  spawnRipple(to);
+  if (!reduced && req.ripple !== false) spawnRipple(to);
 
   return record;
 }

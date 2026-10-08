@@ -64,6 +64,9 @@
   🚫 不要"为了保险"加 filter，要守住这个结构。
 - **搜索绝不筛选未命中的泡泡**：只降 `opacity`，**一条都不能移除**。
   冒烟里有常驻断言"换任何查询词泡泡总数不变"。
+  **阶段 7 例外（2026-10-08 用户已确认）**：当前空间未归档想法 >800 时，
+  固定渲染面积最大的 300 个 + 当前搜索命中；清空/换词只回收额外命中的 DOM。
+  基底不能被搜索移除，全部本地记录与物理节点仍保留。≤800 的原断言不变。
 - **泡泡 DOM 三层**：`.bubble`(位置) > `.bubble-scale`(缩放) > `.bubble-inner`(视觉)。
   三层各管一个 transform，绝不重叠。
 - **WAAPI 的 fill 策略**：起始态用 `backwards`；需要动画结束后读值的用 `forwards`；
@@ -92,8 +95,8 @@
 npm run serve          # 本地起服务（必须，file:// 打不开）
 npm run build          # esbuild 打包
 npm run typecheck      # tsc --noEmit
-npm test               # 纯逻辑单元测试（Node 里跑，312 项）
-npm run smoke          # 🔴 真实 Chrome 端到端（要先 serve），160 项
+npm test               # 纯逻辑单元测试（Node 里跑，341 项）
+npm run smoke          # 🔴 真实 Chrome 端到端（要先 serve），192 项
 npm run check:secrets  # 提交前密钥扫描
 ```
 

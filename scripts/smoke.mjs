@@ -21,6 +21,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { seedStress } from './stress-data.mjs';
 
 const URL_BASE = process.env.SMOKE_URL ?? 'http://127.0.0.1:8000';
 const CDP_PORT = Number(process.env.CDP_PORT ?? 9333);
@@ -409,6 +410,8 @@ async function main() {
     ok(iso.spaceIds.length === 2, '力场里登记了 2 个互相独立的泡泡分区', isolationReport);
 
     // 行为验证：B 在被模拟时，A 的泡泡必须一动不动
+    // Capture a stable A baseline; CDP calls and the async switch otherwise include A's own remaining ticks.
+    await settle(cdp);
     const aPositionsBefore = JSON.stringify(await evaluate(cdp, `window.__nebula.positions(${JSON.stringify(spaceA)})`));
     await evaluate(cdp, `window.__nebula.switchSpace(${JSON.stringify(spaceB)})`);
     await sleep(1500); // 让 B 的力导向充分跑一段时间
@@ -1747,6 +1750,7 @@ async function main() {
       typeof (await evaluate(cdp, `typeof window.__nebula.logout`)) === 'string',
       '演练13：有明确的退出登录入口',
     );
+    await runStage7(cdp);
   } finally {
     try {
       cdp?.close();
@@ -1774,6 +1778,119 @@ async function main() {
     for (const f of failures) console.log(`  · ${f}`);
     process.exitCode = 1;
   }
+}
+
+async function runStage7(cdp) {
+  console.log('\n── 阶段7：触屏、键盘与性能分档 ──');
+  // The entire smoke run owns a mkdtemp profile. No regular browser data is touched.
+  await cdp.send('Storage.clearDataForOrigin', {origin: new globalThis.URL(URL_BASE).origin, storageTypes: 'all'});
+  await cdp.send('Emulation.setDeviceMetricsOverride', {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
+  await cdp.send('Emulation.setTouchEmulationEnabled', {enabled: true, maxTouchPoints: 5});
+  await cdp.send('Page.navigate', {url: URL_BASE});
+  await sleep(500);
+  ok(await waitUntil(cdp, '!!window.__nebula && document.readyState === "complete"'), '手机尺寸正常启动');
+  await typeAndEnter(cdp, '触屏验证');
+  await settle(cdp);
+  await evaluate(cdp, 'window.__nebula.fitAll(); document.activeElement.blur()');
+  const target = await centerOf(cdp, '.bubble--idea:not(.bubble--shadow)');
+  const touch = (type, points) => cdp.send('Input.dispatchTouchEvent', {type, touchPoints: points.map((p,i) => ({...p, id: i+1, radiusX: 2, radiusY: 2}))});
+  const at = {x: target.x, y: target.y};
+  await touch('touchStart', [at]);
+  await touch('touchMove', [{x: at.x + 30, y: at.y + 20}]);
+  ok(await evaluate(cdp, 'window.__nebula.isDragging()'), '真实触屏移动进入泡泡拖拽');
+  const before = await evaluate(cdp, 'window.__nebula.viewport()');
+  const a = {x: at.x + 30, y: at.y + 20}, b = {x: at.x + 90, y: at.y + 20};
+  await touch('touchStart', [a,b]);
+  ok(!(await evaluate(cdp, 'window.__nebula.isDragging()')), '第二指落下取消单指拖拽');
+  await touch('touchMove', [{x: a.x - 15, y: a.y}, {x: b.x + 15, y: b.y}]);
+  const after = await evaluate(cdp, 'window.__nebula.viewport()');
+  ok(after.scale > before.scale, '真实双指分开使星云放大');
+  ok(Math.abs((await evaluate(cdp, 'visualViewport.scale')) - 1) < .01, '捏合没有缩放浏览器页面');
+  await touch('touchEnd', []);
+  ok(!(await evaluate(cdp, 'window.__nebula.isZoomed()')), '捏合结束不误开阅读放大');
+  ok((await evaluate(cdp, 'window.scrollY')) === 0, '触屏拖拽和捏合没有滚动页面');
+  ok((await evaluate(cdp, 'getComputedStyle(document.querySelector(".input")).touchAction')).includes('pan-y'), '输入框保留原生纵向滚动');
+  await settle(cdp);
+
+  const keyboard = await evaluate(cdp, `(() => {
+    const vv = visualViewport, dock = document.querySelector('.dock');
+    document.querySelector('#input').focus();
+    const baseline = dock.getBoundingClientRect().bottom;
+    Object.defineProperty(vv, 'height', {configurable: true, value: innerHeight - 250});
+    Object.defineProperty(vv, 'offsetTop', {configurable: true, value: 40});
+    vv.dispatchEvent(new Event('resize'));
+    const shift = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--kb'));
+    const bottom = dock.getBoundingClientRect().bottom;
+    const expected = Math.max(0, baseline - vv.height - vv.offsetTop);
+    document.body.style.height = (innerHeight - 250) + 'px';
+    vv.dispatchEvent(new Event('resize'));
+    const shrunk = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--kb'));
+    document.body.style.height = '';
+    delete vv.height; delete vv.offsetTop;
+    document.activeElement.blur(); vv.dispatchEvent(new Event('resize'));
+    return {shift, expected, bottom, visualBottom: innerHeight - 210, shrunk,
+      restored: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--kb'))};
+  })()`);
+  ok(Math.abs(keyboard.shift - keyboard.expected) < 1 && keyboard.shift > 0, 'visualViewport resize 实际驱动 --kb（模拟键盘，非 Safari 真机）');
+  ok(keyboard.bottom <= keyboard.visualBottom + 1, '底栏移动到可视区内');
+  ok(keyboard.shrunk === 0, '布局已缩小时不会重复补偿键盘高度');
+  ok(keyboard.restored === 0, '键盘收起后底栏恢复');
+  await evaluate(cdp, `(() => { const el=document.querySelector('#input'); el.value='可滚动的正文\\n'.repeat(40); el.dispatchEvent(new Event('input')); el.scrollTop=0; el.blur(); })()`);
+  const scrollAt = await evaluate(cdp, `(() => { const r=document.querySelector('#input').getBoundingClientRect(); return {x:r.left+30, y:r.bottom-20}; })()`);
+  await touch('touchStart', [scrollAt]);
+  for (let n=1;n<=4;n++) { await touch('touchMove', [{x:scrollAt.x,y:scrollAt.y-n*15}]); await sleep(30); }
+  await touch('touchEnd', []);
+  await sleep(150);
+  ok((await evaluate(cdp, 'document.querySelector("#input").scrollTop')) > 0, '真实触屏仍能滚动多行输入框');
+  await evaluate(cdp, 'const el=document.querySelector("#input"); el.value=""; el.dispatchEvent(new Event("input"))');
+
+  await cdp.send('Emulation.setDeviceMetricsOverride', {width: 1024, height: 800, deviceScaleFactor: 1, mobile: false});
+  await cdp.send('Emulation.setTouchEmulationEnabled', {enabled: false});
+  const seed = n => evaluate(cdp, `(${seedStress.toString()})(${n})`);
+  // Existing touch fixture is archived, not deleted, to get exact active-space counts.
+  await evaluate(cdp, `(async () => { const a=window.__nebula; for (const i of await a.listIdeas()) await a.store.putIdea({...i, archived:1}); })()`);
+  const full = await seed(300);
+  ok(full.renderTier === 'full' && full.rendered === 300, '300 个想法全开且全部渲染');
+  const light = await seed(800);
+  ok(light.renderTier === 'light' && light.rendered === 800, '800 个想法进入轻量档但不裁剪');
+  ok((await evaluate(cdp, 'getComputedStyle(document.querySelector(".bubble--idea .bubble-label")).fontSize')) === '12px', '轻量档字号从 13px 降到 12px');
+  await typeAndEnter(cdp, '轻量档录入');
+  ok((await evaluate(cdp, 'document.querySelectorAll(".ripple").length')) === 0, '轻量档录入不生成涟漪');
+  const culled = await evaluate(cdp, 'window.__nebula.performance()');
+  ok(culled.ideas === 801 && culled.rendered === 300, '第 801 条落定后切到最大 300 个');
+  ok((await evaluate(cdp, 'window.__nebula.field.activeBodies.length')) === 802, 'DOM 裁剪保留全部 801 个物理节点和心泡泡');
+  ok(!(await evaluate(cdp, '!!document.querySelector("[data-id=stress-00000]")')), '小泡泡探针原本未渲染');
+  const baseIds = await evaluate(cdp, 'Array.from(document.querySelectorAll("#world .bubble--idea"), e => e.dataset.id).sort()');
+  await evaluate(cdp, 'const s=document.querySelector("#search"); s.value="觅"; s.dispatchEvent(new Event("input", {bubbles:true}))');
+  await sleep(250);
+  ok((await evaluate(cdp, 'window.__nebula.searchState().hits')) === 1, '裁剪后仍搜索全部数据，找到唯一隐藏命中');
+  ok((await evaluate(cdp, 'window.__nebula.performance().rendered')) === 301, '隐藏命中补入 DOM');
+  const searchedIds = await evaluate(cdp, 'Array.from(document.querySelectorAll("#world .bubble--idea"), e => e.dataset.id)');
+  ok(baseIds.every(id => searchedIds.includes(id)), '搜索保留全部 300 个基础泡泡');
+  await evaluate(cdp, 'window.__nebula.clearSearch()');
+  ok(JSON.stringify(await evaluate(cdp, 'Array.from(document.querySelectorAll("#world .bubble--idea"), e => e.dataset.id).sort()')) === JSON.stringify(baseIds), '清空搜索只移除额外命中，恢复相同底图');
+  ok((await evaluate(cdp, 'window.__nebula.listIdeas().then(l=>l.filter(i=>i.archived===0).length)')) === 801, '裁剪和搜索不删除本地数据');
+
+  await cdp.send('Emulation.setEmulatedMedia', {features: [{name: 'prefers-reduced-motion', value: 'reduce'}]});
+  await sleep(50);
+  await typeAndEnter(cdp, '减少动态验证');
+  ok((await evaluate(cdp, 'window.__nebula.lastFlight().mode')) === 'fade', '系统减少动态效果时飞入改为淡入');
+  const fade = await evaluate(cdp, 'window.__nebula.lastFlight()');
+  ok(Math.hypot(fade.shadowEnd.x - fade.to.x, fade.shadowEnd.y - fade.to.y) < 3, '淡入在终点原位发生，影子交接不跳');
+  ok((await evaluate(cdp, 'document.querySelectorAll(".ripple").length')) === 0, '减少动态效果不产生涟漪');
+  await settle(cdp, 20000);
+  await evaluate(cdp, 'window.__nebula.field.wake(.01)');
+  ok((await evaluate(cdp, 'window.__nebula.field.tier()')) === 'asleep', '减少动态效果时禁止余温档弱唤醒');
+  await cdp.send('Input.dispatchKeyEvent', {type:'keyDown', key:'F2', code:'F2', windowsVirtualKeyCode:113});
+  await sleep(700);
+  ok((await evaluate(cdp, 'document.querySelector(".performance-panel").textContent')).includes('fps'), 'F2 打开面板并更新实测 rAF 帧率');
+  await cdp.send('Input.dispatchKeyEvent', {type:'keyUp', key:'F2', code:'F2', windowsVirtualKeyCode:113});
+  await cdp.send('Input.dispatchKeyEvent', {type:'keyDown', key:'F2', code:'F2', windowsVirtualKeyCode:113});
+  ok(await evaluate(cdp, 'document.querySelector(".performance-panel").hidden'), 'F2 再按一次关闭面板');
+  const unsafe = await evaluate(cdp, `Array.from(document.querySelectorAll('.bubble')).some(el => {
+    const s=getComputedStyle(el); return s.willChange !== 'auto' || s.filter !== 'none' || s.backdropFilter !== 'none';
+  })`);
+  ok(!unsafe, '泡泡没有常驻 will-change、filter 或 backdrop-filter');
 }
 
 main().catch((err) => {

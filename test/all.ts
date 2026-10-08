@@ -18,6 +18,7 @@ import { runAnimTests } from './anim';
 import { runSearchTests } from './search';
 import { runMergeTests } from './merge';
 import { summary } from './assert';
+import { runMobilePerformanceTests } from './mobilePerformance';
 
 runRngTests();
 runTextTests();
@@ -27,6 +28,7 @@ runDragTests();
 runAnimTests();
 runSearchTests();
 runMergeTests();
+runMobilePerformanceTests();
 
 const result = summary();
 

@@ -14,6 +14,8 @@
  */
 
 :root {
+  --kb: 0px;
+  --bubble-font-reduction: 0px;
   --font-stack: system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-size: 13px;
 
@@ -236,6 +238,10 @@ body {
   /* 用元素中心对齐路径点，于是"影子中心落在哪"就等于"泡泡落在哪" */
   offset-anchor: center;
   pointer-events: none;
+}
+
+.bubble--shadow .bubble-label {
+  font-size: calc(var(--font-size) - var(--bubble-font-reduction));
 }
 
 .ripple {
@@ -516,6 +522,7 @@ body {
 /* ── 底部栏 ─────────────────────────────────────────────── */
 
 .dock {
+  transform: translateY(calc(-1 * var(--kb)));
   flex: none;
   padding: 8px 18px calc(14px + env(safe-area-inset-bottom, 0px));
   border-top: 1px solid var(--border);
@@ -847,4 +854,27 @@ body {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Stage 7: the canvas alone owns touch gestures; dialogs and textareas scroll normally. */
+.layer-panel, .input { touch-action: pan-y pinch-zoom; }
+.performance-panel[hidden] { display: none; }
+.performance-panel {
+  position: fixed;
+  z-index: 100;
+  top: max(8px, env(safe-area-inset-top, 0px));
+  left: 8px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: 12px/1.5 ui-monospace, monospace;
+  white-space: pre;
+  pointer-events: none;
+}
+:root[data-render-tier="light"] .bubble-inner,
+:root[data-render-tier="culled"] .bubble-inner { box-shadow: none; }
+@media (max-width: 600px) {
+  .dock { padding-inline: 10px; }
+  .input, .search-input, .layer input { font-size: 16px; }
 }

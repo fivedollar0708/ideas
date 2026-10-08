@@ -4,7 +4,7 @@
 > 它记录的是**现状**（已经建成什么样、哪些决策已锁定、哪些坑已经踩过），
 > 而 `PROJECT-SPEC.md` 是**当初的设计意图**。两者冲突时，以这份为准。
 >
-> 更新日期：2026-10-06 ｜ 最新提交：`4c8aa7a`
+> 更新日期：2026-10-08 ｜ 阶段 7 实现与验收状态见 §7；阶段 0–6 基线版本：`a344cb3`
 
 ---
 
@@ -53,7 +53,8 @@
 | 6.5 | **多用户：每人一个账号、一个私有数据仓库** | `80cc318` |
 | 6.6 | **设备级登录（免口令，登录一次以后都记得）** | `4c8aa7a` |
 
-**当前门禁全绿**：`typecheck` 零错误 / `npm test` 312 项 / `npm run smoke` 160 项（连跑两次稳定）/ `check:secrets` 通过。
+**已上线版本门禁**：`typecheck` 零错误 / `npm test` 312 项 / `npm run smoke` 160 项（连跑两次稳定）/ `check:secrets` 通过。
+**阶段 7 发布门禁（2026-10-08）**：`typecheck` 零错误 / 单元测试 341 项 / 冒烟 192 项。
 
 ---
 
@@ -99,6 +100,8 @@
 - **空间隔离是结构性的**：力场里 `grids: Map<spaceId, Grid>`，`neighborsOf()` **没有任何 spaceId 过滤条件** ——
   因为查到别的空间在结构上不可能。不要加 filter，要守住这个结构。
 - **搜索绝不筛选未命中的泡泡**：只降 `opacity`，一条都不能移除。冒烟有常驻断言"换任何查询词泡泡总数不变"。
+  阶段 7 用户确认的例外：**当前空间未归档想法 >800** 时，固定最大的 300 个 DOM 基底 + 当前搜索命中。
+  搜索不能移除基底，只可回收额外命中。全量记录、搜索目标与空间分区内的物理节点都保留；≤800 原规则不变。
 - **泡泡 DOM 三层**：`.bubble`(位置) > `.bubble-scale`(缩放) > `.bubble-inner`(视觉)。三层各管一个 transform。
 - **WAAPI 的 fill 策略**：起始态用 `backwards`；需要动画结束后读值的用 `forwards`；**永远别用 `both`**。
 - **性能四禁**：`filter: blur()` / 常驻 `will-change` / 改 `width|height|left|top` 做动画 / 几百个元素上的大半径 `box-shadow`。
@@ -165,10 +168,29 @@ readLocalDoc / installRemote / setRemoteFactory 等，冒烟测试全靠它。
 
 ## 7. 待办
 
-### 阶段 7 · 移动端与性能（下一步）
+### 阶段 7 · 移动端与性能
+**代码已实现并通过发布门禁，真机验收待做**：
+- `src/interact/mobile.ts`：visualViewport resize/scroll + `--kb`；测量底栏实际遮挡，避免 dvh 已收缩后重复补偿。
+  现有 `100dvh`、safe-area 保留。画布的双指捏合会取消单指拖拽；输入框与浮层保持原生滚动。
+- `src/render.ts`：300/800 阈值集中定义；300 全开，301–800 关涟漪/glow、字号降 1px，>800 固定面积最大 300 + 搜索命中。
+  心泡泡不计数且不裁剪；面积相同按 id 稳定排序。拖拽/阅读中的 DOM 临时保留，结束后回收。
+- 减少动态效果：飞入为原位淡入、不播涟漪，力导向跳过 eco 余温档。
+- F2 性能面板：rAF 帧率、想法总数/DOM 数量、渲染档/力场档；关闭或页面隐藏时停止采样。
+- `window.__nebula` 新增 `performance()` / `viewport()` / `refresh()` 调试出口。
+- `scripts/stress.mjs` 用**全新临时 Chrome profile**，通过现有 store 调试接口灌数据并测量；不使用常用浏览器的账号或数据。
+
+压测使用方法（本地 HTTP 服务启动后）：
+```bash
+node scripts/stress.mjs 800 --visible  # 灌 800 条并保持测试窗口；F2 看面板，终端 Enter 结束并清理
+node scripts/stress.mjs 300,800,801   # 自动输出每档活跃力场/停稳平移的帧率、p95、长帧与 longtask
+node scripts/stress.mjs 800 --mobile --visible # 手机尺寸模拟，不能替代真机
+```
+本机终端缺少 npm/Node PATH 时，使用 Codex bundled Node 的绝对路径；具体启动方法与压测结果见 `scripts/stage7-performance.md`。
+
+**仍需验收**：
 - **真机**验（iPhone Safari + Android Chrome）：键盘弹起不遮输入框、触屏拖拽不触发页面滚动
 - 灌 800 条，桌面 + 手机各录一次帧率，确认无长帧
-- 性能分档（>300 关涟漪/字号降 1px；>800 只渲染最大的 300 个 + 搜索命中）
+- 800 条密集初始布局的 headless 压测已观察到长帧；不能把“分档已实现”写成“无长帧已验收”。
 
 ### 阶段 8 · AI 能力（只预留，不实现调用）
 - `AIProvider` 接口 + noop 实现，调用不报错

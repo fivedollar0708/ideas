@@ -131,6 +131,17 @@ export class ForceField {
 
   private active: Id | null = null;
   private alphaValue = 0;
+  private reducedMotion = false;
+
+  setReducedMotion(reduced: boolean): void {
+    this.reducedMotion = reduced;
+    if (reduced && this.alphaValue <= 0.02) this.stop();
+  }
+
+  private stop(): void {
+    this.alphaValue = 0;
+    for (const body of this.activeBodies) { body.vx = 0; body.vy = 0; }
+  }
 
   constructor(params: Partial<ForceParams> = {}) {
     this.params = { ...DEFAULT_PARAMS, ...params };
@@ -175,6 +186,7 @@ export class ForceField {
 
   /** 唤醒布局。新泡泡落定、拖动、窗口变化时调用。 */
   wake(strength = 0.35): void {
+    if (this.reducedMotion && strength <= 0.02) return;
     if (strength > this.alphaValue) this.alphaValue = strength;
   }
 
@@ -368,6 +380,7 @@ export class ForceField {
 
   private decayAlpha(): void {
     const next = this.alphaValue * (1 - this.params.alphaDecay);
+    if (this.reducedMotion && next <= 0.02) { this.stop(); return; }
     this.alphaValue = next < this.params.alphaMin ? 0 : next;
   }
 

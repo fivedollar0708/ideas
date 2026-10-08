@@ -203,7 +203,7 @@ export function createIdeaBubble(
   label.className = 'bubble-label';
   // 🔴 一律 textContent：这里渲染的是用户自己输入的文本，用 innerHTML 等于执行用户输入
   label.textContent = text;
-  label.style.fontSize = `${FONT_SIZE}px`;
+  label.style.fontSize = `calc(${FONT_SIZE}px - var(--bubble-font-reduction, 0px))`;
   inner.style.setProperty('--lines', String(fitLines(ry)));
   inner.appendChild(label);
 

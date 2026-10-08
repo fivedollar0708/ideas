@@ -92,6 +92,7 @@ export function velocityFromSamples(
 }
 
 export interface DragHooks {
+  blocked?(): boolean;
   /** 从事件目标找到要拖的 body。返回 null 表示点在空白处（交给画布平移）。 */
   hitTest(target: EventTarget | null): Body | null;
   /** 屏幕客户端坐标 → world 坐标。 */
@@ -105,6 +106,7 @@ export interface DragHooks {
 }
 
 export interface DragHandle {
+  cancel(): void;
   destroy(): void;
   /** 当前是否有拖拽在进行（自动化测试用）。 */
   readonly isDragging: boolean;
@@ -131,6 +133,7 @@ export function mountDrag(stage: HTMLElement, hooks: DragHooks): DragHandle {
   };
 
   const onPointerDown = (e: PointerEvent): void => {
+    if (hooks.blocked?.()) return;
     if (active) return; // 已经有一个手势在进行（例如多指）
     // 鼠标只响应主键；触屏/笔的 button 恒为 0
     if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -152,6 +155,7 @@ export function mountDrag(stage: HTMLElement, hooks: DragHooks): DragHandle {
 
   const onPointerMove = (e: PointerEvent): void => {
     if (!active || e.pointerId !== activePointerId) return;
+    if (e.pointerType === 'touch' && e.cancelable) e.preventDefault();
 
     const w = pushSample(e);
 
@@ -204,6 +208,9 @@ export function mountDrag(stage: HTMLElement, hooks: DragHooks): DragHandle {
   window.addEventListener('pointercancel', onPointerCancel);
 
   return {
+    cancel: () => {
+      if (active) finish({ pointerId: activePointerId } as PointerEvent, true);
+    },
     get isDragging(): boolean {
       return dragging;
     },

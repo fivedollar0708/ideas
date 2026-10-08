@@ -40,6 +40,7 @@
       return s;
     };
     const onPointerDown = (e) => {
+      if (hooks.blocked?.()) return;
       if (active) return;
       if (e.pointerType === "mouse" && e.button !== 0) return;
       const hit = hooks.hitTest(e.target);
@@ -55,6 +56,7 @@
     };
     const onPointerMove = (e) => {
       if (!active || e.pointerId !== activePointerId) return;
+      if (e.pointerType === "touch" && e.cancelable) e.preventDefault();
       const w = pushSample(e);
       if (!dragging) {
         const first = samples[0];
@@ -91,6 +93,9 @@
     window.addEventListener("pointerup", onPointerUp);
     window.addEventListener("pointercancel", onPointerCancel);
     return {
+      cancel: () => {
+        if (active) finish({ pointerId: activePointerId }, true);
+      },
       get isDragging() {
         return dragging;
       },
@@ -101,6 +106,214 @@
         window.removeEventListener("pointercancel", onPointerCancel);
       }
     };
+  }
+
+  // src/types.ts
+  var MAX_TEXT = 280;
+  var SPACE_NAME_DEFAULT = "\u672A\u547D\u540D";
+  var TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1e3;
+  var HEART_ORIGIN = { x: 0, y: 0 };
+  var VIEW_SCALE_MIN = 0.25;
+  var VIEW_SCALE_MAX = 3;
+  var HEART_SCALE = 1.15;
+  var HEART_MIN_RADIUS = 44;
+  var HEART_MAX_RADIUS = 88;
+  var HEART_NAME_MEASURE_MAX = 12;
+  var SPACE_RESTORE_SUFFIX = "\uFF08\u6062\u590D\uFF09";
+  var SPAWN_MIN_RADIUS = 200;
+  var SPAWN_MAX_RADIUS = 320;
+
+  // src/view.ts
+  function identityViewport() {
+    return { scale: 1, tx: 0, ty: 0 };
+  }
+  function worldToScreen(vp, p) {
+    return { x: p.x * vp.scale + vp.tx, y: p.y * vp.scale + vp.ty };
+  }
+  function screenToWorld(vp, p) {
+    return { x: (p.x - vp.tx) / vp.scale, y: (p.y - vp.ty) / vp.scale };
+  }
+  function worldTransform(vp) {
+    return `translate3d(${vp.tx}px, ${vp.ty}px, 0) scale(${vp.scale})`;
+  }
+  function zoomAt(vp, anchorScreen, factor) {
+    const scale = clampScale(vp.scale * factor);
+    const applied = scale / vp.scale;
+    return {
+      scale,
+      tx: anchorScreen.x - (anchorScreen.x - vp.tx) * applied,
+      ty: anchorScreen.y - (anchorScreen.y - vp.ty) * applied
+    };
+  }
+  function clampScale(scale) {
+    return Math.min(VIEW_SCALE_MAX, Math.max(VIEW_SCALE_MIN, scale));
+  }
+  function fitToContent(points, radiusPad, viewportSize, padding = 64) {
+    if (points.length === 0) {
+      return { scale: 1, tx: viewportSize.w / 2, ty: viewportSize.h / 2 };
+    }
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of points) {
+      if (p.x - radiusPad < minX) minX = p.x - radiusPad;
+      if (p.y - radiusPad < minY) minY = p.y - radiusPad;
+      if (p.x + radiusPad > maxX) maxX = p.x + radiusPad;
+      if (p.y + radiusPad > maxY) maxY = p.y + radiusPad;
+    }
+    const contentW = Math.max(1, maxX - minX);
+    const contentH = Math.max(1, maxY - minY);
+    const availW = Math.max(1, viewportSize.w - padding * 2);
+    const availH = Math.max(1, viewportSize.h - padding * 2);
+    const fitted = Math.min(availW / contentW, availH / contentH);
+    const scale = Math.max(VIEW_SCALE_MIN, Math.min(1, fitted));
+    const centerWorld = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+    return {
+      scale,
+      tx: viewportSize.w / 2 - centerWorld.x * scale,
+      ty: viewportSize.h / 2 - centerWorld.y * scale
+    };
+  }
+
+  // src/interact/mobile.ts
+  function keyboardShift(layoutBottom, height, offsetTop, scale) {
+    return Math.abs(scale - 1) > 0.01 ? 0 : Math.max(0, layoutBottom - height - offsetTop);
+  }
+  function mountKeyboard(dock) {
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    let shift = 0;
+    const update = () => {
+      const focused = document.activeElement?.matches('input, textarea, [contenteditable="true"]');
+      const baseline = dock.getBoundingClientRect().bottom + shift;
+      shift = focused ? keyboardShift(baseline, viewport.height, viewport.offsetTop, viewport.scale) : 0;
+      document.documentElement.style.setProperty("--kb", `${shift}px`);
+    };
+    viewport.addEventListener("resize", update);
+    viewport.addEventListener("scroll", update);
+    window.addEventListener("resize", update);
+    document.addEventListener("focusin", update);
+    document.addEventListener("focusout", () => requestAnimationFrame(update));
+    new ResizeObserver(update).observe(dock);
+    update();
+  }
+  function pinchViewport(start, anchor, center, ratio) {
+    const world = screenToWorld(start, anchor);
+    const scale = Math.max(0.25, Math.min(3, start.scale * ratio));
+    return { scale, tx: center.x - world.x * scale, ty: center.y - world.y * scale };
+  }
+  function mountPinch(stage, hooks) {
+    let blocked = false;
+    let start = null;
+    const geometry = (touches) => {
+      const a = touches[0], b = touches[1];
+      const rect = stage.getBoundingClientRect();
+      return {
+        center: { x: (a.clientX + b.clientX) / 2 - rect.left, y: (a.clientY + b.clientY) / 2 - rect.top },
+        distance: Math.max(1, Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY)),
+        ids: [a.identifier, b.identifier]
+      };
+    };
+    stage.addEventListener("touchstart", (e) => {
+      if (e.touches.length < 2) return;
+      e.preventDefault();
+      blocked = true;
+      hooks.cancelSingle();
+      start = { ...geometry(e.touches), viewport: { ...hooks.viewport() } };
+    }, { passive: false });
+    stage.addEventListener("touchmove", (e) => {
+      if (e.cancelable) e.preventDefault();
+      if (!start || e.touches.length < 2) return;
+      const next = geometry(e.touches);
+      if (next.ids.some((id, i) => id !== start.ids[i])) {
+        start = { ...next, viewport: { ...hooks.viewport() } };
+        return;
+      }
+      hooks.apply(pinchViewport(start.viewport, start.center, next.center, next.distance / start.distance));
+    }, { passive: false });
+    const end = (e) => {
+      if (!blocked) return;
+      if (e.cancelable) e.preventDefault();
+      if (e.touches.length < 2 && start) {
+        start = null;
+        hooks.save();
+      }
+      if (e.touches.length === 0) blocked = false;
+    };
+    stage.addEventListener("touchend", end, { passive: false });
+    stage.addEventListener("touchcancel", end, { passive: false });
+    stage.addEventListener("click", (e) => {
+      if (blocked) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    }, true);
+    return { get active() {
+      return blocked;
+    } };
+  }
+
+  // src/render.ts
+  var PERFORMANCE = {
+    fullLimit: 300,
+    cullAfter: 800,
+    largestCount: 300,
+    fontReduction: 1
+  };
+  function renderPolicy(count) {
+    return {
+      tier: count <= PERFORMANCE.fullLimit ? "full" : count <= PERFORMANCE.cullAfter ? "light" : "culled",
+      ripple: count <= PERFORMANCE.fullLimit,
+      glow: count <= PERFORMANCE.fullLimit,
+      fontReduction: count <= PERFORMANCE.fullLimit ? 0 : PERFORMANCE.fontReduction,
+      culled: count > PERFORMANCE.cullAfter
+    };
+  }
+  function renderedIds(bodies, hits) {
+    const ids = renderPolicy(bodies.length).culled ? [...bodies].sort((a, b) => b.rx * b.ry - a.rx * a.ry || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).slice(0, PERFORMANCE.largestCount).map((b) => b.id) : bodies.map((b) => b.id);
+    return /* @__PURE__ */ new Set([...ids, ...hits]);
+  }
+
+  // src/ui/performance.ts
+  function mountPerformancePanel(snapshot) {
+    const panel = document.createElement("output");
+    panel.className = "performance-panel";
+    panel.hidden = true;
+    document.body.appendChild(panel);
+    let raf = 0;
+    let from = 0;
+    let frames = 0;
+    let fps = 0;
+    const draw = (now) => {
+      frames++;
+      if (now - from >= 500) {
+        fps = frames * 1e3 / (now - from);
+        from = now;
+        frames = 0;
+        const s = snapshot();
+        panel.textContent = `${fps.toFixed(1)} fps (rAF)
+\u6CE1\u6CE1 ${s.ideas} \xB7 DOM ${s.rendered}
+\u6E32\u67D3 ${s.renderTier} \xB7 \u529B\u573A ${s.forceTier}`;
+      }
+      raf = requestAnimationFrame(draw);
+    };
+    const start = () => {
+      from = performance.now();
+      frames = 0;
+      raf = requestAnimationFrame(draw);
+    };
+    window.addEventListener("keydown", (e) => {
+      if (e.key !== "F2" || e.repeat) return;
+      e.preventDefault();
+      panel.hidden = !panel.hidden;
+      cancelAnimationFrame(raf);
+      if (!panel.hidden && !document.hidden) start();
+    });
+    document.addEventListener("visibilitychange", () => {
+      cancelAnimationFrame(raf);
+      if (!panel.hidden && !document.hidden) start();
+    });
   }
 
   // src/rng.ts
@@ -179,6 +392,18 @@
     grids = /* @__PURE__ */ new Map();
     active = null;
     alphaValue = 0;
+    reducedMotion = false;
+    setReducedMotion(reduced) {
+      this.reducedMotion = reduced;
+      if (reduced && this.alphaValue <= 0.02) this.stop();
+    }
+    stop() {
+      this.alphaValue = 0;
+      for (const body of this.activeBodies) {
+        body.vx = 0;
+        body.vy = 0;
+      }
+    }
     constructor(params = {}) {
       this.params = { ...DEFAULT_PARAMS, ...params };
     }
@@ -213,6 +438,7 @@
     }
     /** 唤醒布局。新泡泡落定、拖动、窗口变化时调用。 */
     wake(strength = 0.35) {
+      if (this.reducedMotion && strength <= 0.02) return;
       if (strength > this.alphaValue) this.alphaValue = strength;
     }
     /** 三档降频。让静止时 CPU 真的是 0，而不是一直在跑。 */
@@ -357,6 +583,10 @@
     }
     decayAlpha() {
       const next = this.alphaValue * (1 - this.params.alphaDecay);
+      if (this.reducedMotion && next <= 0.02) {
+        this.stop();
+        return;
+      }
       this.alphaValue = next < this.params.alphaMin ? 0 : next;
     }
     gridMetrics() {
@@ -379,21 +609,6 @@
       this.grids.set(spaceId, grid);
     }
   };
-
-  // src/types.ts
-  var MAX_TEXT = 280;
-  var SPACE_NAME_DEFAULT = "\u672A\u547D\u540D";
-  var TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1e3;
-  var HEART_ORIGIN = { x: 0, y: 0 };
-  var VIEW_SCALE_MIN = 0.25;
-  var VIEW_SCALE_MAX = 3;
-  var HEART_SCALE = 1.15;
-  var HEART_MIN_RADIUS = 44;
-  var HEART_MAX_RADIUS = 88;
-  var HEART_NAME_MEASURE_MAX = 12;
-  var SPACE_RESTORE_SUFFIX = "\uFF08\u6062\u590D\uFF09";
-  var SPAWN_MIN_RADIUS = 200;
-  var SPAWN_MAX_RADIUS = 320;
 
   // src/text.ts
   var FONT_STACK = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC", "Noto Sans CJK SC", system-ui, -apple-system, "Segoe UI", sans-serif';
@@ -670,7 +885,7 @@
     const label = document.createElement("div");
     label.className = "bubble-label";
     label.textContent = text;
-    label.style.fontSize = `${FONT_SIZE}px`;
+    label.style.fontSize = `calc(${FONT_SIZE}px - var(--bubble-font-reduction, 0px))`;
     inner.style.setProperty("--lines", String(fitLines(ry)));
     inner.appendChild(label);
     const view = { el, scale, inner, label, body, text, destroy: () => {
@@ -830,21 +1045,23 @@
     const { rx, ry } = radiusOfCached(text);
     const lift = req.lift ?? ARC_LIFT_MIN + (ARC_LIFT_MAX - ARC_LIFT_MIN) * 0.5;
     const control = arcControlPoint(from, to, lift);
-    const record = { from, control, to, shadowEnd: null, landedAt: null };
+    const reduced = prefersReducedMotion();
+    const record = { mode: reduced ? "fade" : "arc", from, control, to, shadowEnd: null, landedAt: null };
     lastFlight = record;
-    if (prefersReducedMotion()) {
-      spawnRipple(to);
-      record.shadowEnd = { ...to };
-      return record;
-    }
     const layer = ensureFxLayer();
     const shadow = buildShadow(text, rx, ry);
-    shadow.style.offsetPath = pathDataFor(from, control, to);
+    if (reduced) {
+      shadow.style.transform = `translate(${to.x}px, ${to.y}px)`;
+      shadow.style.marginLeft = `${-rx}px`;
+      shadow.style.marginTop = `${-ry}px`;
+    } else {
+      shadow.style.offsetPath = pathDataFor(from, control, to);
+    }
     layer.appendChild(shadow);
     const anim = shadow.animate(
-      [{ offsetDistance: "0%" }, { offsetDistance: "100%" }],
+      reduced ? [{ opacity: "0" }, { opacity: "1" }] : [{ offsetDistance: "0%" }, { offsetDistance: "100%" }],
       {
-        duration: FLY_MS,
+        duration: reduced ? 140 : FLY_MS,
         easing: "cubic-bezier(.3,.1,.35,1)",
         // 🔴 必须 fill: 'forwards'。默认的 'none' 会在动画一结束就把 offset-distance
         //    弹回基础值（0%），于是"影子已经飞到了"这件事在测量时根本看不到 ——
@@ -860,7 +1077,7 @@
     const rect = shadow.getBoundingClientRect();
     record.shadowEnd = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     shadow.remove();
-    spawnRipple(to);
+    if (!reduced && req.ripple !== false) spawnRipple(to);
     return record;
   }
   function playPop(scaleEl, light = false, delay = 0) {
@@ -2794,59 +3011,6 @@
     }
   };
 
-  // src/view.ts
-  function identityViewport() {
-    return { scale: 1, tx: 0, ty: 0 };
-  }
-  function worldToScreen(vp, p) {
-    return { x: p.x * vp.scale + vp.tx, y: p.y * vp.scale + vp.ty };
-  }
-  function screenToWorld(vp, p) {
-    return { x: (p.x - vp.tx) / vp.scale, y: (p.y - vp.ty) / vp.scale };
-  }
-  function worldTransform(vp) {
-    return `translate3d(${vp.tx}px, ${vp.ty}px, 0) scale(${vp.scale})`;
-  }
-  function zoomAt(vp, anchorScreen, factor) {
-    const scale = clampScale(vp.scale * factor);
-    const applied = scale / vp.scale;
-    return {
-      scale,
-      tx: anchorScreen.x - (anchorScreen.x - vp.tx) * applied,
-      ty: anchorScreen.y - (anchorScreen.y - vp.ty) * applied
-    };
-  }
-  function clampScale(scale) {
-    return Math.min(VIEW_SCALE_MAX, Math.max(VIEW_SCALE_MIN, scale));
-  }
-  function fitToContent(points, radiusPad, viewportSize, padding = 64) {
-    if (points.length === 0) {
-      return { scale: 1, tx: viewportSize.w / 2, ty: viewportSize.h / 2 };
-    }
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const p of points) {
-      if (p.x - radiusPad < minX) minX = p.x - radiusPad;
-      if (p.y - radiusPad < minY) minY = p.y - radiusPad;
-      if (p.x + radiusPad > maxX) maxX = p.x + radiusPad;
-      if (p.y + radiusPad > maxY) maxY = p.y + radiusPad;
-    }
-    const contentW = Math.max(1, maxX - minX);
-    const contentH = Math.max(1, maxY - minY);
-    const availW = Math.max(1, viewportSize.w - padding * 2);
-    const availH = Math.max(1, viewportSize.h - padding * 2);
-    const fitted = Math.min(availW / contentW, availH / contentH);
-    const scale = Math.max(VIEW_SCALE_MIN, Math.min(1, fitted));
-    const centerWorld = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
-    return {
-      scale,
-      tx: viewportSize.w / 2 - centerWorld.x * scale,
-      ty: viewportSize.h / 2 - centerWorld.y * scale
-    };
-  }
-
   // src/main.ts
   var HEART_ID = "__heart__";
   var DOUBLE_CLICK_GUARD_MS = 220;
@@ -2887,6 +3051,11 @@
     current = null;
     /** ideaId → 泡泡 DOM */
     views = /* @__PURE__ */ new Map();
+    /** Full records and bodies survive DOM culling; searching never reads only the views. */
+    currentIdeas = /* @__PURE__ */ new Map();
+    pinch = null;
+    cancelPan = () => {
+    };
     heartView = null;
     heartBody = null;
     viewport = identityViewport();
@@ -2954,6 +3123,27 @@
       });
       this.bindViewportGestures();
       this.mountDragController();
+      mountKeyboard(must(".dock"));
+      this.pinch = mountPinch(this.stage, {
+        viewport: () => this.viewport,
+        cancelSingle: () => {
+          this.drag?.cancel();
+          this.cancelPan();
+          window.clearTimeout(this.tapTimer);
+          cancelAnimationFrame(this.viewportAnim);
+          this.lastTapView = null;
+        },
+        apply: (viewport) => {
+          this.viewport = viewport;
+          this.applyViewport();
+        },
+        save: () => this.scheduleViewportSave()
+      });
+      const motion = matchMedia("(prefers-reduced-motion: reduce)");
+      const updateMotion = () => this.field.setReducedMotion(motion.matches);
+      motion.addEventListener("change", updateMotion);
+      updateMotion();
+      mountPerformancePanel(() => this.performanceSnapshot());
       this.bindLifecycleFlush();
       this.searchInput = must("#search");
       this.searchHint = must("#search-hint");
@@ -3246,8 +3436,9 @@
         must("#search-count"),
         this.searchHint,
         {
-          targets: () => [...this.views.values()].map((v) => ({ id: v.body.id, text: v.text })),
+          targets: () => [...this.currentIdeas.values()].map((i) => ({ id: i.id, text: i.text })),
           apply: (states, query) => {
+            this.reconcileViews(new Set(states.filter((s) => s.hit).map((s) => s.id)));
             if (this.heartView) setSearchState(this.heartView, false);
             for (const state of states) {
               const view = this.views.get(state.id);
@@ -3257,6 +3448,7 @@
             }
           },
           clear: () => {
+            this.reconcileViews(/* @__PURE__ */ new Set());
             if (this.heartView) clearSearchState(this.heartView);
             for (const view of this.views.values()) {
               clearSearchState(view);
@@ -3359,6 +3551,7 @@
     // ── 拖拽 ──────────────────────────────────────────────
     mountDragController() {
       this.drag = mountDrag(this.stage, {
+        blocked: () => this.pinch?.active ?? false,
         hitTest: (target) => {
           const el = target instanceof Element ? target.closest(".bubble") : null;
           const id = el?.dataset.id;
@@ -3390,6 +3583,7 @@
           this.field.wake(0.5);
           this.startLoop();
           this.schedulePositionSave(body.id, Date.now());
+          this.search?.refresh();
         },
         onTap: (body, at) => {
           const view = this.views.get(body.id);
@@ -3452,6 +3646,7 @@
         onClose: () => {
           setHidden(view, false);
           this.zoom = null;
+          this.search?.refresh();
         }
       });
     }
@@ -3488,7 +3683,7 @@
       const pending = [...this.pendingPosition.entries()];
       this.pendingPosition.clear();
       for (const [ideaId, movedAt] of pending) {
-        const body = this.views.get(ideaId)?.body;
+        const body = this.field.activeBodies.find((b) => b.id === ideaId);
         if (!body) continue;
         const idea = await this.store.getIdea(ideaId);
         if (!idea) continue;
@@ -3613,6 +3808,8 @@
       await this.store.setLastSpaceId(space.id);
       for (const view of this.views.values()) view.destroy();
       this.views.clear();
+      this.currentIdeas.clear();
+      this.markQuery.clear();
       this.heartView?.destroy();
       this.heartView = null;
       applyAccent(this.world, space.hue);
@@ -3641,14 +3838,11 @@
       for (const idea of ideas) {
         const body = this.bodyFromIdea(idea);
         bodies.push(body);
-        const view = createIdeaBubble(body, idea.text, {
-          onDblClick: (v) => this.handleDblClick(v)
-        });
-        this.views.set(idea.id, view);
-        this.world.appendChild(view.el);
+        this.currentIdeas.set(idea.id, idea);
       }
       this.field.setActiveSpace(space.id);
       this.field.setSpaceBodies(space.id, bodies);
+      this.reconcileViews(this.searchHits());
       if (!opts.quiet) {
         if (this.heartView) playPop(this.heartView.scale, true, 0);
         let order = 1;
@@ -3727,6 +3921,45 @@
     writeAll() {
       for (const view of this.views.values()) writePosition(view);
       if (this.heartView) writePosition(this.heartView);
+    }
+    searchHits() {
+      const query = this.search?.query ?? "";
+      return new Set([...this.currentIdeas.values()].filter((i) => query !== "" && scoreMatch(i.text, query) > 0).map((i) => i.id));
+    }
+    reconcileViews(hits) {
+      const bodies = this.field.activeBodies.filter((b) => b.id !== HEART_ID);
+      const policy = renderPolicy(bodies.length);
+      const root = document.documentElement;
+      root.dataset.renderTier = policy.tier;
+      root.style.setProperty("--bubble-font-reduction", `${policy.fontReduction}px`);
+      const selected = renderedIds(bodies, hits);
+      for (const [id, view] of this.views) {
+        if (view.body.dragging || view.el.classList.contains("bubble--hidden")) selected.add(id);
+      }
+      for (const [id, view] of this.views) {
+        if (selected.has(id)) continue;
+        view.destroy();
+        this.views.delete(id);
+        this.markQuery.delete(id);
+      }
+      for (const body of bodies) {
+        if (!selected.has(body.id) || this.views.has(body.id)) continue;
+        const idea = this.currentIdeas.get(body.id);
+        if (!idea) continue;
+        const view = createIdeaBubble(body, idea.text, { onDblClick: (v) => this.handleDblClick(v) });
+        setPinned(view, body.pinned);
+        this.views.set(body.id, view);
+        this.world.appendChild(view.el);
+        writePosition(view);
+      }
+    }
+    performanceSnapshot() {
+      return {
+        ideas: this.currentIdeas.size,
+        rendered: this.views.size,
+        renderTier: renderPolicy(this.currentIdeas.size).tier,
+        forceTier: this.field.tier()
+      };
     }
     // ── 视口 ──────────────────────────────────────────────
     applyViewport() {
@@ -3808,16 +4041,28 @@
       let lastX = 0;
       let lastY = 0;
       let moved = false;
+      let panPointer = -1;
+      this.cancelPan = () => {
+        panning = false;
+        try {
+          this.stage.releasePointerCapture(panPointer);
+        } catch {
+        }
+        panPointer = -1;
+      };
       this.stage.addEventListener("pointerdown", (e) => {
+        if (this.pinch?.active || panning || e.pointerType === "mouse" && e.button !== 0) return;
         if (e.target !== this.stage) return;
         panning = true;
+        panPointer = e.pointerId;
         moved = false;
         lastX = e.clientX;
         lastY = e.clientY;
         this.stage.setPointerCapture(e.pointerId);
       });
       this.stage.addEventListener("pointermove", (e) => {
-        if (!panning) return;
+        if (!panning || this.pinch?.active || e.pointerId !== panPointer) return;
+        if (e.pointerType === "touch" && e.cancelable) e.preventDefault();
         const dx = e.clientX - lastX;
         const dy = e.clientY - lastY;
         if (dx !== 0 || dy !== 0) moved = true;
@@ -3827,7 +4072,7 @@
         this.applyViewport();
       });
       const endPan = (e) => {
-        if (!panning) return;
+        if (!panning || e.pointerId !== panPointer) return;
         panning = false;
         try {
           this.stage.releasePointerCapture(e.pointerId);
@@ -3838,6 +4083,7 @@
       this.stage.addEventListener("pointerup", endPan);
       this.stage.addEventListener("pointercancel", endPan);
       this.stage.addEventListener("dblclick", (e) => {
+        if (this.pinch?.active) return;
         if (e.target !== this.stage) return;
         this.fitAll();
       });
@@ -3978,7 +4224,9 @@
       this.ensureVisible(body);
       const from = this.inputCenter();
       const to = this.worldToStageScreen(body.x, body.y);
-      const record = await flyIn({ text: idea.text, from, to });
+      const policy = renderPolicy(this.currentIdeas.size + 1);
+      document.documentElement.style.setProperty("--bubble-font-reduction", `${policy.fontReduction}px`);
+      const record = await flyIn({ text: idea.text, from, to, ripple: policy.ripple });
       if (this.current?.id !== space.id) return;
       const view = createIdeaBubble(body, idea.text, {
         onDblClick: (v) => this.handleDblClick(v)
@@ -3994,11 +4242,13 @@
       const bodies = this.field.bodiesOf(space.id);
       bodies.push(body);
       this.field.setSpaceBodies(space.id, bodies);
+      this.currentIdeas.set(idea.id, idea);
       playPop(view.scale);
       this.field.wake(0.45);
       this.startLoop();
       this.writeAll();
       this.updateStatusLine();
+      this.search?.refresh();
     }
     /** 输入框中心（视口坐标）—— 飞入的起点。 */
     inputCenter() {
@@ -4028,6 +4278,12 @@
       const api = {
         store: this.store,
         field: this.field,
+        performance: () => this.performanceSnapshot(),
+        viewport: () => ({ ...this.viewport }),
+        refresh: () => {
+          this.markSearchDirty();
+          return this.refreshCurrentSpace({ quiet: true });
+        },
         spaces: () => this.spaces,
         current: () => this.current,
         switchSpace: (id) => this.switchSpace(id),

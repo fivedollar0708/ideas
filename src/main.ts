@@ -13,6 +13,9 @@
  */
 
 import { mountDrag, type DragHandle } from './interact/drag';
+import { mountKeyboard, mountPinch } from './interact/mobile';
+import { renderPolicy, renderedIds } from './render';
+import { mountPerformancePanel } from './ui/performance';
 import { ForceField, type Body } from './physics/force';
 import {
   applyAccent,
@@ -138,6 +141,10 @@ class App {
 
   /** ideaId → 泡泡 DOM */
   private readonly views = new Map<string, BubbleView>();
+  /** Full records and bodies survive DOM culling; searching never reads only the views. */
+  private readonly currentIdeas = new Map<string, Idea>();
+  private pinch: { readonly active: boolean } | null = null;
+  private cancelPan: () => void = () => {};
   private heartView: BubbleView | null = null;
   private heartBody: Body | null = null;
 
@@ -222,6 +229,24 @@ class App {
 
     this.bindViewportGestures();
     this.mountDragController();
+    mountKeyboard(must<HTMLElement>('.dock'));
+    this.pinch = mountPinch(this.stage, {
+      viewport: () => this.viewport,
+      cancelSingle: () => {
+        this.drag?.cancel();
+        this.cancelPan();
+        window.clearTimeout(this.tapTimer);
+        cancelAnimationFrame(this.viewportAnim);
+        this.lastTapView = null;
+      },
+      apply: viewport => { this.viewport = viewport; this.applyViewport(); },
+      save: () => this.scheduleViewportSave(),
+    });
+    const motion = matchMedia('(prefers-reduced-motion: reduce)');
+    const updateMotion = (): void => this.field.setReducedMotion(motion.matches);
+    motion.addEventListener('change', updateMotion);
+    updateMotion();
+    mountPerformancePanel(() => this.performanceSnapshot());
     this.bindLifecycleFlush();
 
     this.searchInput = must<HTMLInputElement>('#search');
@@ -564,10 +589,10 @@ class App {
       must<HTMLElement>('#search-count'),
       this.searchHint,
       {
-        targets: () =>
-          [...this.views.values()].map((v) => ({ id: v.body.id, text: v.text })),
+        targets: () => [...this.currentIdeas.values()].map(i => ({ id: i.id, text: i.text })),
 
         apply: (states, query) => {
+          this.reconcileViews(new Set(states.filter(s => s.hit).map(s => s.id)));
           // 心泡泡不是搜索结果。搜索时把它一起变暗 ——
           // 否则它会成为画面里最亮的东西、被误当成命中（实测观感问题）
           if (this.heartView) setSearchState(this.heartView, false);
@@ -580,6 +605,7 @@ class App {
         },
 
         clear: () => {
+          this.reconcileViews(new Set());
           if (this.heartView) clearSearchState(this.heartView);
           for (const view of this.views.values()) {
             clearSearchState(view);
@@ -705,6 +731,7 @@ class App {
 
   private mountDragController(): void {
     this.drag = mountDrag(this.stage, {
+      blocked: () => this.pinch?.active ?? false,
       hitTest: (target) => {
         const el = target instanceof Element ? (target.closest('.bubble') as HTMLElement | null) : null;
         const id = el?.dataset.id;
@@ -744,6 +771,7 @@ class App {
         this.field.wake(0.5);
         this.startLoop();
         this.schedulePositionSave(body.id, Date.now());
+        this.search?.refresh();
       },
 
       onTap: (body, at) => {
@@ -822,6 +850,7 @@ class App {
       onClose: () => {
         setHidden(view, false);
         this.zoom = null;
+        this.search?.refresh();
       },
     });
   }
@@ -865,7 +894,7 @@ class App {
     this.pendingPosition.clear();
 
     for (const [ideaId, movedAt] of pending) {
-      const body = this.views.get(ideaId)?.body;
+      const body = this.field.activeBodies.find(b => b.id === ideaId);
       if (!body) continue; // 已经切了空间，这次的坐标作废（切空间前会先 flush）
 
       const idea = await this.store.getIdea(ideaId);
@@ -1022,6 +1051,8 @@ class App {
     // 拆掉上一个空间的所有泡泡（只拆 DOM，数据不动）
     for (const view of this.views.values()) view.destroy();
     this.views.clear();
+    this.currentIdeas.clear();
+    this.markQuery.clear();
     this.heartView?.destroy();
     this.heartView = null;
 
@@ -1057,16 +1088,13 @@ class App {
     for (const idea of ideas) {
       const body = this.bodyFromIdea(idea);
       bodies.push(body);
-      const view = createIdeaBubble(body, idea.text, {
-        onDblClick: (v) => this.handleDblClick(v),
-      });
-      this.views.set(idea.id, view);
-      this.world.appendChild(view.el);
+      this.currentIdeas.set(idea.id, idea);
     }
 
     // 🔴 力场的空间分区在这里登记：这个空间之后只和它自己的泡泡互相作用
     this.field.setActiveSpace(space.id);
     this.field.setSpaceBodies(space.id, bodies);
+    this.reconcileViews(this.searchHits());
 
     // 首屏装配：错开一点点播"轻落定"，像星云自己聚拢起来，而不是"啪"地全出现。
     // 总错开量封顶 380ms —— 再长会让人等。
@@ -1168,6 +1196,49 @@ class App {
     if (this.heartView) writePosition(this.heartView);
   }
 
+  private searchHits(): Set<string> {
+    const query = this.search?.query ?? '';
+    return new Set([...this.currentIdeas.values()].filter(i => query !== '' && scoreMatch(i.text, query) > 0).map(i => i.id));
+  }
+
+  private reconcileViews(hits: ReadonlySet<string>): void {
+    const bodies = this.field.activeBodies.filter(b => b.id !== HEART_ID);
+    const policy = renderPolicy(bodies.length);
+    const root = document.documentElement;
+    root.dataset.renderTier = policy.tier;
+    root.style.setProperty('--bubble-font-reduction', `${policy.fontReduction}px`);
+    const selected = renderedIds(bodies, hits);
+    // A query change must not detach an element under an active drag or zoom.
+    for (const [id, view] of this.views) {
+      if (view.body.dragging || view.el.classList.contains('bubble--hidden')) selected.add(id);
+    }
+    for (const [id, view] of this.views) {
+      if (selected.has(id)) continue;
+      view.destroy();
+      this.views.delete(id);
+      this.markQuery.delete(id);
+    }
+    for (const body of bodies) {
+      if (!selected.has(body.id) || this.views.has(body.id)) continue;
+      const idea = this.currentIdeas.get(body.id);
+      if (!idea) continue;
+      const view = createIdeaBubble(body, idea.text, { onDblClick: v => this.handleDblClick(v) });
+      setPinned(view, body.pinned);
+      this.views.set(body.id, view);
+      this.world.appendChild(view.el);
+      writePosition(view);
+    }
+  }
+
+  private performanceSnapshot() {
+    return {
+      ideas: this.currentIdeas.size,
+      rendered: this.views.size,
+      renderTier: renderPolicy(this.currentIdeas.size).tier,
+      forceTier: this.field.tier(),
+    };
+  }
+
   // ── 视口 ──────────────────────────────────────────────
 
   private applyViewport(): void {
@@ -1263,11 +1334,19 @@ class App {
     let lastX = 0;
     let lastY = 0;
     let moved = false;
+    let panPointer = -1;
+    this.cancelPan = () => {
+      panning = false;
+      try { this.stage.releasePointerCapture(panPointer); } catch { /* already released */ }
+      panPointer = -1;
+    };
 
     this.stage.addEventListener('pointerdown', (e) => {
+      if (this.pinch?.active || panning || (e.pointerType === 'mouse' && e.button !== 0)) return;
       // 只在真正的空白处起拖（#world 是 0 尺寸容器，背景点击的 target 就是 #stage）
       if (e.target !== this.stage) return;
       panning = true;
+      panPointer = e.pointerId;
       moved = false;
       lastX = e.clientX;
       lastY = e.clientY;
@@ -1275,7 +1354,8 @@ class App {
     });
 
     this.stage.addEventListener('pointermove', (e) => {
-      if (!panning) return;
+      if (!panning || this.pinch?.active || e.pointerId !== panPointer) return;
+      if (e.pointerType === 'touch' && e.cancelable) e.preventDefault();
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
       if (dx !== 0 || dy !== 0) moved = true;
@@ -1286,7 +1366,7 @@ class App {
     });
 
     const endPan = (e: PointerEvent): void => {
-      if (!panning) return;
+      if (!panning || e.pointerId !== panPointer) return;
       panning = false;
       try {
         this.stage.releasePointerCapture(e.pointerId);
@@ -1299,6 +1379,7 @@ class App {
     this.stage.addEventListener('pointercancel', endPan);
 
     this.stage.addEventListener('dblclick', (e) => {
+      if (this.pinch?.active) return;
       if (e.target !== this.stage) return;
       this.fitAll();
     });
@@ -1481,7 +1562,9 @@ class App {
     const from = this.inputCenter();
     const to = this.worldToStageScreen(body.x, body.y);
 
-    const record = await flyIn({ text: idea.text, from, to });
+    const policy = renderPolicy(this.currentIdeas.size + 1);
+    document.documentElement.style.setProperty('--bubble-font-reduction', `${policy.fontReduction}px`);
+    const record = await flyIn({ text: idea.text, from, to, ripple: policy.ripple });
 
     // 飞入期间用户可能切了空间。那就先不建视图 —— 数据已经在库里，
     // 下次打开这个空间时它会自然出现在落点上。
@@ -1507,6 +1590,7 @@ class App {
     const bodies = this.field.bodiesOf(space.id);
     bodies.push(body);
     this.field.setSpaceBodies(space.id, bodies);
+    this.currentIdeas.set(idea.id, idea);
 
     // "啵"
     playPop(view.scale);
@@ -1515,6 +1599,7 @@ class App {
     this.startLoop();
     this.writeAll();
     this.updateStatusLine();
+    this.search?.refresh();
   }
 
   /** 输入框中心（视口坐标）—— 飞入的起点。 */
@@ -1549,6 +1634,9 @@ class App {
     const api = {
       store: this.store,
       field: this.field,
+      performance: () => this.performanceSnapshot(),
+      viewport: () => ({ ...this.viewport }),
+      refresh: () => { this.markSearchDirty(); return this.refreshCurrentSpace({ quiet: true }); },
       spaces: () => this.spaces,
       current: () => this.current,
       switchSpace: (id: string) => this.switchSpace(id),
