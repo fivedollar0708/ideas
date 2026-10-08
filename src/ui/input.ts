@@ -40,7 +40,9 @@ export function mountInput(options: InputOptions): InputHandle {
   const autoGrow = (): void => {
     // 一次性布局更新（不是逐帧动画），不受"动画只准动 transform"的约束
     el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 132)}px`;
+    const style = getComputedStyle(el);
+    const borders = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+    el.style.height = `${Math.min(Math.ceil(el.scrollHeight + borders), 132)}px`;
   };
 
   async function submit(): Promise<void> {

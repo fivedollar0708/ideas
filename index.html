@@ -22,13 +22,17 @@
 </div>
 
 <!-- 空间切换浮层 -->
-<div id="space-layer" class="layer" hidden>
+<div id="space-layer" class="layer space-overview" hidden>
   <div class="layer-backdrop"></div>
-  <div class="layer-panel" role="dialog" aria-label="切换空间">
-    <h2 class="layer-title">切换空间</h2>
+  <div class="layer-panel space-map" role="dialog" aria-modal="true" aria-label="空间星图">
+    <header class="space-map-header">
+      <div><p class="eyebrow">YOUR UNIVERSE</p><h2 class="layer-title">空间星图</h2>
+      <p class="space-map-hint">每一颗星体，都是一片属于你的思想空间。</p></div>
+      <button id="space-close" class="icon-button" type="button" aria-label="返回当前空间">×</button>
+    </header>
     <div class="space-list"></div>
     <div class="layer-actions">
-      <button id="space-create" class="btn" type="button">新建空间</button>
+      <button id="space-create" class="btn btn--primary" type="button">＋ 新建空间</button>
       <button id="space-trash" class="btn" type="button">回收站</button>
     </div>
   </div>
@@ -91,7 +95,11 @@
   </div>
 </div>
 
-<footer class="dock">
+<button id="tools-toggle" class="icon-button tools-toggle" type="button" aria-label="打开搜索与工具" aria-expanded="false" aria-controls="tools-panel" title="搜索与工具 · Ctrl/⌘ K">
+  <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M5 19l2-2M17 7l2-2"></path></svg>
+</button>
+<section id="tools-panel" class="tools-panel" aria-label="搜索与工具" hidden>
+  <p class="eyebrow">OBSERVATORY</p>
   <p class="meta">
     <span id="space-name" class="space-name">…</span>
     <span id="space-count" class="space-count">0 条</span>
@@ -101,24 +109,27 @@
       id="search"
       class="search-input"
       type="search"
-      placeholder="⌕ 搜索想法…"
+      placeholder="搜索这片星云…"
       autocomplete="off"
       spellcheck="false"
       aria-label="搜索想法">
     <span id="search-count" class="search-count" aria-live="polite"></span>
   </div>
   <button id="sync-bar" class="sync-bar" type="button">只存在这台设备 · 点这里登录</button>
+  <details class="developer-tools"><summary>开发工具</summary>
+    <div class="devrow"><button id="selftest" type="button" class="btn">自检</button>
+    <pre id="selftest-out" class="selftest-out"></pre></div>
+    <p class="sync-hint">F2 显示性能面板</p>
+  </details>
+</section>
+<footer class="dock">
   <p id="notice" class="notice" role="status" aria-live="polite"></p>
   <textarea
     id="input"
     class="input"
     rows="1"
-    placeholder="想到什么，扔进来…（回车记下，Shift+回车换行）"
+    placeholder="让一个念头，成为星光…"
     aria-label="记一条想法"></textarea>
-  <div class="devrow">
-    <button id="selftest" type="button" class="btn">自检</button>
-    <pre id="selftest-out" class="selftest-out"></pre>
-  </div>
 </footer>
 
 <!-- 🔴 同样必须是 ./ 相对路径 -->

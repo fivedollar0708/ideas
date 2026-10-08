@@ -12,7 +12,7 @@
 本地 IndexedDB 是权威副本，GitHub 是镜像。
 
 - 技术栈：TypeScript + esbuild + **零运行时依赖** + DOM 渲染（不用 canvas）+ 自写力导向
-- **阶段 0–6 已完成**（含多用户 + 免口令登录）。剩下阶段 7（移动端与性能）、8（AI 预留）、9（收尾）
+- **阶段 0–6 已完成**（含多用户 + 免口令登录）。阶段 7 代码与 UI 修订已实现，真机待验收；剩下阶段 8（AI 预留）、9（收尾）
 
 ## 2. 开工前必读
 
@@ -96,7 +96,7 @@ npm run serve          # 本地起服务（必须，file:// 打不开）
 npm run build          # esbuild 打包
 npm run typecheck      # tsc --noEmit
 npm test               # 纯逻辑单元测试（Node 里跑，341 项）
-npm run smoke          # 🔴 真实 Chrome 端到端（要先 serve），192 项
+npm run smoke          # 🔴 真实 Chrome 端到端（要先 serve），211 项
 npm run check:secrets  # 提交前密钥扫描
 ```
 

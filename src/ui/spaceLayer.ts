@@ -2,9 +2,9 @@
  * 空间切换浮层。
  *
  * 交互（用户亲自定的）：
- *  - 点击心泡泡 → 浮出本层，底层星云变暗，**所有空间的心泡泡**浮现
+ *  - 点击心泡泡 → 全屏星图，底层想法暂时隐藏，**所有空间的心泡泡**浮现
  *  - 单击某个空间泡泡 → 切换到该空间
- *  - 双击某个空间泡泡 → 原地重命名
+ *  - 独立的改名按钮 → 原地重命名（触屏也可用）
  *  - 每个泡泡右侧有个「×」→ 删除该空间（走回收站）
  *  - 底部：「新建空间」「打开回收站」
  *  - 点空白 / Esc → 收回
@@ -13,13 +13,10 @@
  *    删掉心泡泡等于删掉整个空间。把它做成一个独立的、明确的动作，
  *    可以避免"我只是想移动它，结果整个空间没了"这种事。
  *
- * ⚠️ 单击与双击在同一元素上天然冲突（双击会先触发一次 click）。
- *    这里的选择是：**单击立即切换，双击进入改名**，不做 200ms 点击延迟判别。
- *    延迟判别会让每次切空间都明显变钝，而"双击别的空间时顺手切过去并进入改名"
- *    本身无害。若你更在意语义精确，在 handleClick 里加个 setTimeout 即可。
+ * 单击进入空间与改名使用独立入口：第一下点击关闭星图后无法再接收 dblclick。
+ * 导航星体只代表已有 Space，不创建合成 Space，不参与想法的力场。
  *
- * 🔴 元素**原地更新、不重建**：切换当前空间时只改 class。
- *    如果每次刷新都重建元素，双击的第二下会落在新元素上，dblclick 根本不会触发。
+ * 🔴 元素**原地更新、不重建**：保存改名时保留行与焦点，避免编辑中被异步刷新打断。
  */
 
 import { hueAccent, hueSoft } from '../render/bubble';
@@ -40,6 +37,7 @@ interface Row {
   label: HTMLElement;
   del: HTMLButtonElement;
   renameInput: HTMLInputElement | null;
+  renameForm: HTMLElement | null;
 }
 
 export class SpaceLayer {
@@ -61,6 +59,13 @@ export class SpaceLayer {
     this.listEl = root.querySelector('.space-list') as HTMLElement;
 
     this.backdrop.addEventListener('click', () => this.close());
+    root.addEventListener('click', event => {
+      if (event.target === this.listEl || (event.target as HTMLElement).classList.contains('space-map')) this.close();
+    });
+    window.visualViewport?.addEventListener('resize', () => {
+      if (!this.opened || !this.renaming) return;
+      requestAnimationFrame(() => this.rows.get(this.renaming ?? '')?.renameInput?.scrollIntoView({block: 'nearest'}));
+    });
 
     (root.querySelector('#space-create') as HTMLButtonElement).addEventListener('click', () =>
       this.opts.onCreate(),
@@ -68,6 +73,7 @@ export class SpaceLayer {
     (root.querySelector('#space-trash') as HTMLButtonElement).addEventListener('click', () =>
       this.opts.onOpenTrash(),
     );
+    (root.querySelector('#space-close') as HTMLButtonElement).addEventListener('click', () => this.close());
 
     this.root.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
@@ -86,15 +92,21 @@ export class SpaceLayer {
     this.render(spaces);
     this.root.hidden = false;
     this.root.classList.add('layer--visible');
+    document.body.classList.add('space-overview-open');
     this.opened = true;
+    if (!focusRename) this.rows.get(currentId)?.main.focus({preventScroll: true});
   }
 
   close(): void {
     if (this.renaming) this.cancelRename();
     this.root.classList.remove('layer--visible');
     this.root.hidden = true;
+    document.body.classList.remove('space-overview-open');
     this.opened = false;
     this.pendingRenameId = null;
+    if (this.root.contains(document.activeElement)) {
+      document.querySelector<HTMLElement>('#world .bubble--heart')?.focus({preventScroll: true});
+    }
   }
 
   /** 空间列表变化（新建 / 删除 / 恢复 / 改名）后刷新。 */
@@ -113,6 +125,7 @@ export class SpaceLayer {
 
       row.space = space;
       row.label.textContent = space.name;
+      row.main.setAttribute('aria-label', `进入空间 ${space.name}`);
       row.root.classList.toggle('is-current', space.id === this.currentId);
       row.root.style.setProperty('--accent', hueAccent(space.hue));
       row.root.style.setProperty('--accent-soft', hueSoft(space.hue));
@@ -139,7 +152,7 @@ export class SpaceLayer {
       const target = this.pendingRenameId;
       this.pendingRenameId = null;
       // 等浮层过渡起来一点再聚焦：iOS 上立刻聚焦会让键盘把浮层顶飞
-      window.setTimeout(() => this.startRename(target), 120);
+      window.setTimeout(() => { if (this.opened) this.startRename(target); }, 120);
     }
   }
 
@@ -167,16 +180,21 @@ export class SpaceLayer {
     del.title = `删除空间「${space.name}」`;
     del.setAttribute('aria-label', `删除空间 ${space.name}`);
 
-    root.append(main, del);
+    const actions = document.createElement('div');
+    actions.className = 'space-chip-actions';
+    const rename = document.createElement('button');
+    rename.type = 'button';
+    rename.className = 'space-chip-rename';
+    rename.textContent = '改名';
+    rename.setAttribute('aria-label', `重命名空间 ${space.name}`);
+    rename.addEventListener('click', () => this.startRename(space.id));
+    actions.append(rename, del);
+    root.append(main, actions);
 
-    const row: Row = { space, root, main, label, del, renameInput: null };
+    const row: Row = { space, root, main, label, del, renameInput: null, renameForm: null };
     this.rows.set(space.id, row);
 
     main.addEventListener('click', () => this.handleClick(space.id));
-    main.addEventListener('dblclick', (e) => {
-      e.preventDefault();
-      this.startRename(space.id);
-    });
     del.addEventListener('click', (e) => {
       e.stopPropagation();
       this.opts.onDelete(space.id);
@@ -198,7 +216,7 @@ export class SpaceLayer {
 
   startRename(spaceId: string): void {
     const row = this.rows.get(spaceId);
-    if (!row || this.renaming) return;
+    if (!row || this.renaming || !this.opened) return;
 
     this.renaming = spaceId;
     row.root.classList.add('is-renaming');
@@ -210,11 +228,28 @@ export class SpaceLayer {
     input.maxLength = 24;
     input.setAttribute('aria-label', '空间名');
 
-    row.label.replaceWith(input);
+    // Editing is a sibling of the navigation button, never an input nested inside a button.
+    const form = document.createElement('div');
+    form.className = 'space-edit';
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'btn btn--small';
+    save.textContent = '保存';
+    save.addEventListener('click', () => this.commitRename(input.value));
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'btn btn--small';
+    cancel.textContent = '取消';
+    cancel.addEventListener('click', () => this.cancelRename());
+    form.append(input, save, cancel);
+    row.root.append(form);
+    row.main.disabled = true;
+    row.renameForm = form;
     row.renameInput = input;
 
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
+        if (e.isComposing || e.keyCode === 229) return;
         e.preventDefault();
         this.commitRename(input.value);
       } else if (e.key === 'Escape') {
@@ -225,9 +260,11 @@ export class SpaceLayer {
     });
     input.addEventListener('click', (e) => e.stopPropagation());
     input.addEventListener('dblclick', (e) => e.stopPropagation());
-    // 失焦即提交：点了别处通常就是想"就这么定了"
+    // Moving focus to Save/Cancel stays inside the editor; leaving it commits.
     input.addEventListener('blur', () => {
-      if (this.renaming === spaceId) this.commitRename(input.value);
+      window.setTimeout(() => {
+        if (this.renaming === spaceId && !form.contains(document.activeElement)) this.commitRename(input.value);
+      }, 0);
     });
 
     input.focus();
@@ -243,10 +280,13 @@ export class SpaceLayer {
     if (!row) return;
 
     row.root.classList.remove('is-renaming');
+    row.main.disabled = false;
+    row.renameForm?.remove();
+    row.renameForm = null;
     if (row.renameInput) {
-      row.renameInput.replaceWith(row.label);
       row.renameInput = null;
     }
+    row.main.focus({preventScroll: true});
 
     const name = raw.trim().slice(0, 24);
     if (name === '' || name === row.space.name) return; // 空名字 / 没改动 ⇒ 放弃
@@ -263,9 +303,12 @@ export class SpaceLayer {
     if (!row) return;
 
     row.root.classList.remove('is-renaming');
+    row.main.disabled = false;
+    row.renameForm?.remove();
+    row.renameForm = null;
     if (row.renameInput) {
-      row.renameInput.replaceWith(row.label);
       row.renameInput = null;
     }
+    row.main.focus({preventScroll: true});
   }
 }

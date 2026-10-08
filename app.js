@@ -782,35 +782,26 @@
 
   // src/render/bubble.ts
   var HUE_ACCENTS = [
-    "#534AB7",
-    // 0 紫
-    "#0F6E56",
-    // 1 青
-    "#185FA5",
-    // 2 蓝
-    "#993C1D",
-    // 3 珊瑚
-    "#854F0B",
-    // 4 琥珀
-    "#993556",
-    // 5 粉
-    "#3B6D11",
-    // 6 绿
-    "#A32D2D",
-    // 7 红
-    "#5F5E5A"
-    // 8 灰
+    "#B7AAFF",
+    "#75DCC8",
+    "#8CBDFF",
+    "#F2A68B",
+    "#E7C57F",
+    "#EB9FC8",
+    "#A4D69A",
+    "#F09AAB",
+    "#B1BFDA"
   ];
   var HUE_SOFTS = [
-    "#EEEDFE",
-    "#E1F5EE",
-    "#E6F1FB",
-    "#FAECE7",
-    "#FAEEDA",
-    "#FBEAF0",
-    "#EAF3DE",
-    "#FCEBEB",
-    "#F1EFE8"
+    "#24223E",
+    "#162E31",
+    "#1A2942",
+    "#342A33",
+    "#322E2E",
+    "#33233B",
+    "#233132",
+    "#342338",
+    "#232B3B"
   ];
   function hueAccent(hue) {
     return HUE_ACCENTS[(hue % 9 + 9) % 9];
@@ -906,6 +897,15 @@
     el.classList.add("bubble--heart");
     el.dataset.id = body.id;
     el.dataset.role = "heart";
+    el.tabIndex = 0;
+    el.setAttribute("role", "button");
+    el.setAttribute("aria-label", `${name} \xB7 \u6253\u5F00\u7A7A\u95F4\u661F\u56FE`);
+    el.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        el.click();
+      }
+    });
     el.style.width = `${r * 2}px`;
     el.style.height = `${r * 2}px`;
     el.style.marginLeft = `${-r}px`;
@@ -915,7 +915,7 @@
     label.textContent = name;
     const hint = document.createElement("div");
     hint.className = "bubble-hint";
-    hint.textContent = "\u5207\u6362\u7A7A\u95F4";
+    hint.textContent = "\u7A7A\u95F4\u661F\u56FE";
     inner.appendChild(label);
     inner.appendChild(hint);
     const view = { el, scale, inner, label, body, text: name, destroy: () => {
@@ -935,6 +935,8 @@
     view.el.classList.toggle("bubble--pinned", pinned);
   }
   function updateHeartLabel(view, name) {
+    view.text = name;
+    view.el.setAttribute("aria-label", `${name} \xB7 \u6253\u5F00\u7A7A\u95F4\u661F\u56FE`);
     const label = view.inner.querySelector(".bubble-label");
     if (label) label.textContent = name;
     const r = heartRadiusOf(name);
@@ -2475,7 +2477,9 @@
     let busy = false;
     const autoGrow = () => {
       el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 132)}px`;
+      const style = getComputedStyle(el);
+      const borders = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+      el.style.height = `${Math.min(Math.ceil(el.scrollHeight + borders), 132)}px`;
     };
     async function submit() {
       if (busy) return;
@@ -2759,6 +2763,13 @@
       this.backdrop = root.querySelector(".layer-backdrop");
       this.listEl = root.querySelector(".space-list");
       this.backdrop.addEventListener("click", () => this.close());
+      root.addEventListener("click", (event) => {
+        if (event.target === this.listEl || event.target.classList.contains("space-map")) this.close();
+      });
+      window.visualViewport?.addEventListener("resize", () => {
+        if (!this.opened || !this.renaming) return;
+        requestAnimationFrame(() => this.rows.get(this.renaming ?? "")?.renameInput?.scrollIntoView({ block: "nearest" }));
+      });
       root.querySelector("#space-create").addEventListener(
         "click",
         () => this.opts.onCreate()
@@ -2767,6 +2778,7 @@
         "click",
         () => this.opts.onOpenTrash()
       );
+      root.querySelector("#space-close").addEventListener("click", () => this.close());
       this.root.addEventListener("keydown", (e) => {
         if (e.key !== "Escape") return;
         if (this.renaming) this.cancelRename();
@@ -2782,14 +2794,20 @@
       this.render(spaces);
       this.root.hidden = false;
       this.root.classList.add("layer--visible");
+      document.body.classList.add("space-overview-open");
       this.opened = true;
+      if (!focusRename) this.rows.get(currentId)?.main.focus({ preventScroll: true });
     }
     close() {
       if (this.renaming) this.cancelRename();
       this.root.classList.remove("layer--visible");
       this.root.hidden = true;
+      document.body.classList.remove("space-overview-open");
       this.opened = false;
       this.pendingRenameId = null;
+      if (this.root.contains(document.activeElement)) {
+        document.querySelector("#world .bubble--heart")?.focus({ preventScroll: true });
+      }
     }
     /** 空间列表变化（新建 / 删除 / 恢复 / 改名）后刷新。 */
     render(spaces) {
@@ -2804,6 +2822,7 @@
         }
         row.space = space;
         row.label.textContent = space.name;
+        row.main.setAttribute("aria-label", `\u8FDB\u5165\u7A7A\u95F4 ${space.name}`);
         row.root.classList.toggle("is-current", space.id === this.currentId);
         row.root.style.setProperty("--accent", hueAccent(space.hue));
         row.root.style.setProperty("--accent-soft", hueSoft(space.hue));
@@ -2824,7 +2843,9 @@
       if (this.pendingRenameId) {
         const target = this.pendingRenameId;
         this.pendingRenameId = null;
-        window.setTimeout(() => this.startRename(target), 120);
+        window.setTimeout(() => {
+          if (this.opened) this.startRename(target);
+        }, 120);
       }
     }
     buildRow(space) {
@@ -2847,14 +2868,19 @@
       del.textContent = "\xD7";
       del.title = `\u5220\u9664\u7A7A\u95F4\u300C${space.name}\u300D`;
       del.setAttribute("aria-label", `\u5220\u9664\u7A7A\u95F4 ${space.name}`);
-      root.append(main, del);
-      const row = { space, root, main, label, del, renameInput: null };
+      const actions = document.createElement("div");
+      actions.className = "space-chip-actions";
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "space-chip-rename";
+      rename.textContent = "\u6539\u540D";
+      rename.setAttribute("aria-label", `\u91CD\u547D\u540D\u7A7A\u95F4 ${space.name}`);
+      rename.addEventListener("click", () => this.startRename(space.id));
+      actions.append(rename, del);
+      root.append(main, actions);
+      const row = { space, root, main, label, del, renameInput: null, renameForm: null };
       this.rows.set(space.id, row);
       main.addEventListener("click", () => this.handleClick(space.id));
-      main.addEventListener("dblclick", (e) => {
-        e.preventDefault();
-        this.startRename(space.id);
-      });
       del.addEventListener("click", (e) => {
         e.stopPropagation();
         this.opts.onDelete(space.id);
@@ -2872,7 +2898,7 @@
     // ── 原地重命名 ────────────────────────────────────────
     startRename(spaceId) {
       const row = this.rows.get(spaceId);
-      if (!row || this.renaming) return;
+      if (!row || this.renaming || !this.opened) return;
       this.renaming = spaceId;
       row.root.classList.add("is-renaming");
       const input = document.createElement("input");
@@ -2881,10 +2907,26 @@
       input.value = row.space.name;
       input.maxLength = 24;
       input.setAttribute("aria-label", "\u7A7A\u95F4\u540D");
-      row.label.replaceWith(input);
+      const form = document.createElement("div");
+      form.className = "space-edit";
+      const save = document.createElement("button");
+      save.type = "button";
+      save.className = "btn btn--small";
+      save.textContent = "\u4FDD\u5B58";
+      save.addEventListener("click", () => this.commitRename(input.value));
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "btn btn--small";
+      cancel.textContent = "\u53D6\u6D88";
+      cancel.addEventListener("click", () => this.cancelRename());
+      form.append(input, save, cancel);
+      row.root.append(form);
+      row.main.disabled = true;
+      row.renameForm = form;
       row.renameInput = input;
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
+          if (e.isComposing || e.keyCode === 229) return;
           e.preventDefault();
           this.commitRename(input.value);
         } else if (e.key === "Escape") {
@@ -2896,7 +2938,9 @@
       input.addEventListener("click", (e) => e.stopPropagation());
       input.addEventListener("dblclick", (e) => e.stopPropagation());
       input.addEventListener("blur", () => {
-        if (this.renaming === spaceId) this.commitRename(input.value);
+        window.setTimeout(() => {
+          if (this.renaming === spaceId && !form.contains(document.activeElement)) this.commitRename(input.value);
+        }, 0);
       });
       input.focus();
       input.select();
@@ -2908,10 +2952,13 @@
       const row = this.rows.get(spaceId);
       if (!row) return;
       row.root.classList.remove("is-renaming");
+      row.main.disabled = false;
+      row.renameForm?.remove();
+      row.renameForm = null;
       if (row.renameInput) {
-        row.renameInput.replaceWith(row.label);
         row.renameInput = null;
       }
+      row.main.focus({ preventScroll: true });
       const name = raw.trim().slice(0, 24);
       if (name === "" || name === row.space.name) return;
       this.opts.onRename(spaceId, name);
@@ -2923,10 +2970,54 @@
       const row = this.rows.get(spaceId);
       if (!row) return;
       row.root.classList.remove("is-renaming");
+      row.main.disabled = false;
+      row.renameForm?.remove();
+      row.renameForm = null;
       if (row.renameInput) {
-        row.renameInput.replaceWith(row.label);
         row.renameInput = null;
       }
+      row.main.focus({ preventScroll: true });
+    }
+  };
+
+  // src/ui/tools.ts
+  var ToolsPanel = class {
+    constructor(panel, toggle) {
+      this.panel = panel;
+      this.toggle = toggle;
+      toggle.addEventListener("click", () => this.panel.hidden ? this.open() : this.close());
+      document.addEventListener("pointerdown", (event) => {
+        const target = event.target;
+        if (!panel.contains(target) && !toggle.contains(target)) this.close(false);
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !panel.hidden) {
+          event.preventDefault();
+          this.close();
+        }
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+          if (document.querySelector(".layer:not([hidden]), .zoom-layer:not([hidden])")) return;
+          event.preventDefault();
+          this.open(true);
+        }
+      });
+    }
+    panel;
+    toggle;
+    get isOpen() {
+      return !this.panel.hidden;
+    }
+    open(search = false) {
+      this.panel.hidden = false;
+      this.toggle.setAttribute("aria-expanded", "true");
+      if (search) this.panel.querySelector("#search")?.focus();
+    }
+    close(returnFocus = true) {
+      if (this.panel.hidden) return;
+      const hadFocus = this.panel.contains(document.activeElement);
+      this.panel.hidden = true;
+      this.toggle.setAttribute("aria-expanded", "false");
+      if (returnFocus && hadFocus) this.toggle.focus();
     }
   };
 
@@ -3022,10 +3113,15 @@
     return el;
   }
   function makeNotice(el) {
+    let timer = 0;
     return (message, kind = "info") => {
+      window.clearTimeout(timer);
       el.textContent = message;
       el.dataset.kind = kind;
       if (message === "") delete el.dataset.kind;
+      if (message && kind !== "error") timer = window.setTimeout(() => {
+        el.textContent = "";
+      }, 5e3);
     };
   }
   function spawnPointFor(ideaId) {
@@ -3046,6 +3142,7 @@
     inputEl;
     notice;
     spaceLayer;
+    tools;
     trashLayer;
     spaces = [];
     current = null;
@@ -3110,6 +3207,7 @@
       this.inputEl = must("#input");
       const noticeEl = must("#notice");
       this.notice = makeNotice(noticeEl);
+      this.tools = new ToolsPanel(must("#tools-panel"), must("#tools-toggle"));
       this.spaceLayer = new SpaceLayer(must("#space-layer"), {
         onSwitch: (id) => void this.switchSpace(id),
         onRename: (id, name) => void this.renameSpace(id, name),
@@ -3304,6 +3402,9 @@
       this.syncBar.textContent = snap.detail || "\u53EA\u5B58\u5728\u8FD9\u53F0\u8BBE\u5907";
     }
     openSyncPanel() {
+      this.tools.close(false);
+      this.spaceLayer.close();
+      this.trashLayer.close();
       const accountEl = this.syncLayer.querySelector("#sync-account");
       const switchBtn = this.syncLayer.querySelector("#sync-switch");
       void Promise.all([loadCredential(), this.store.getOwnerHandle()]).then(
@@ -3459,7 +3560,7 @@
           pulse: (id) => this.pulse(id),
           otherSpaceMatches: (query) => this.otherSpaceMatches(query),
           goToSpace: (spaceId) => {
-            void this.switchSpace(spaceId).then(() => this.searchInput.focus());
+            void this.switchSpace(spaceId).then(() => this.tools.open(true));
           }
         }
       );
@@ -4090,6 +4191,9 @@
     }
     // ── 空间操作 ──────────────────────────────────────────
     openSpaceLayer(focusRename) {
+      this.tools.close(false);
+      this.drag?.cancel();
+      this.cancelPan();
       this.trashLayer.close();
       this.spaceLayer.show(this.spaces, this.current?.id ?? "", focusRename);
     }
@@ -4280,6 +4384,7 @@
         field: this.field,
         performance: () => this.performanceSnapshot(),
         viewport: () => ({ ...this.viewport }),
+        uiState: () => ({ tools: this.tools.isOpen, spaceOverview: this.spaceLayer.isOpen }),
         refresh: () => {
           this.markSearchDirty();
           return this.refreshCurrentSpace({ quiet: true });

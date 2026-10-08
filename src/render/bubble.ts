@@ -21,29 +21,15 @@
 import type { Body } from '../physics/force';
 import { FONT_SIZE, lineHeight, radiusOfCached, heartRadiusOf } from '../text';
 
-/** 9 个色板（PROJECT-SPEC.md §4.3）。主色用于描边/心泡泡，浅色用于底色。 */
+/** Nine space identities, brightened for the user-approved dark universe. */
 const HUE_ACCENTS = [
-  '#534AB7', // 0 紫
-  '#0F6E56', // 1 青
-  '#185FA5', // 2 蓝
-  '#993C1D', // 3 珊瑚
-  '#854F0B', // 4 琥珀
-  '#993556', // 5 粉
-  '#3B6D11', // 6 绿
-  '#A32D2D', // 7 红
-  '#5F5E5A', // 8 灰
+  '#B7AAFF', '#75DCC8', '#8CBDFF', '#F2A68B', '#E7C57F',
+  '#EB9FC8', '#A4D69A', '#F09AAB', '#B1BFDA',
 ];
 
 const HUE_SOFTS = [
-  '#EEEDFE',
-  '#E1F5EE',
-  '#E6F1FB',
-  '#FAECE7',
-  '#FAEEDA',
-  '#FBEAF0',
-  '#EAF3DE',
-  '#FCEBEB',
-  '#F1EFE8',
+  '#24223E', '#162E31', '#1A2942', '#342A33', '#322E2E',
+  '#33233B', '#233132', '#342338', '#232B3B',
 ];
 
 export function hueAccent(hue: number): string {
@@ -240,6 +226,12 @@ export function createHeartBubble(
   el.classList.add('bubble--heart');
   el.dataset.id = body.id;
   el.dataset.role = 'heart';
+  el.tabIndex = 0;
+  el.setAttribute('role', 'button');
+  el.setAttribute('aria-label', `${name} · 打开空间星图`);
+  el.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); el.click(); }
+  });
   el.style.width = `${r * 2}px`;
   el.style.height = `${r * 2}px`;
   el.style.marginLeft = `${-r}px`;
@@ -251,7 +243,7 @@ export function createHeartBubble(
 
   const hint = document.createElement('div');
   hint.className = 'bubble-hint';
-  hint.textContent = '切换空间';
+  hint.textContent = '空间星图';
 
   inner.appendChild(label);
   inner.appendChild(hint);
@@ -283,6 +275,8 @@ export function setPinned(view: BubbleView, pinned: boolean): void {
 
 /** 更新心跳泡的文字（重命名后调用）。 */
 export function updateHeartLabel(view: BubbleView, name: string): void {
+  view.text = name;
+  view.el.setAttribute('aria-label', `${name} · 打开空间星图`);
   const label = view.inner.querySelector('.bubble-label');
   if (label) label.textContent = name;
 

@@ -57,6 +57,7 @@ import {
   type SearchHandle,
 } from './ui/search';
 import { SpaceLayer } from './ui/spaceLayer';
+import { ToolsPanel } from './ui/tools';
 import { TrashLayer } from './ui/trash';
 import {
   fitToContent,
@@ -95,10 +96,14 @@ function must<T extends HTMLElement>(selector: string): T {
 }
 
 function makeNotice(el: HTMLElement) {
+  let timer = 0;
   return (message: string, kind: NoticeKind = 'info'): void => {
+    window.clearTimeout(timer);
     el.textContent = message;
     el.dataset.kind = kind;
     if (message === '') delete el.dataset.kind;
+    // Errors stay readable until the next action; routine feedback does not fill the page.
+    if (message && kind !== 'error') timer = window.setTimeout(() => { el.textContent = ''; }, 5000);
   };
 }
 
@@ -134,6 +139,7 @@ class App {
   private readonly notice: (m: string, k?: NoticeKind) => void;
 
   private readonly spaceLayer: SpaceLayer;
+  private readonly tools: ToolsPanel;
   private readonly trashLayer: TrashLayer;
 
   private spaces: Space[] = [];
@@ -213,6 +219,7 @@ class App {
     this.inputEl = must<HTMLTextAreaElement>('#input');
     const noticeEl = must<HTMLElement>('#notice');
     this.notice = makeNotice(noticeEl);
+    this.tools = new ToolsPanel(must<HTMLElement>('#tools-panel'), must<HTMLButtonElement>('#tools-toggle'));
 
     this.spaceLayer = new SpaceLayer(must<HTMLElement>('#space-layer'), {
       onSwitch: (id) => void this.switchSpace(id),
@@ -424,6 +431,9 @@ class App {
   }
 
   private openSyncPanel(): void {
+    this.tools.close(false);
+    this.spaceLayer.close();
+    this.trashLayer.close();
     const accountEl = this.syncLayer.querySelector('#sync-account') as HTMLElement;
     const switchBtn = this.syncLayer.querySelector('#sync-switch') as HTMLButtonElement;
 
@@ -618,7 +628,7 @@ class App {
         otherSpaceMatches: (query) => this.otherSpaceMatches(query),
         goToSpace: (spaceId) => {
           // 用户主动点的，不是"自动飞过去"。搜索词保留，到了那边重建命中
-          void this.switchSpace(spaceId).then(() => this.searchInput.focus());
+          void this.switchSpace(spaceId).then(() => this.tools.open(true));
         },
       },
     );
@@ -1388,6 +1398,9 @@ class App {
   // ── 空间操作 ──────────────────────────────────────────
 
   private openSpaceLayer(focusRename?: string): void {
+    this.tools.close(false);
+    this.drag?.cancel();
+    this.cancelPan();
     // 两个浮层互斥：否则它们会叠在一起，上层的遮罩会挡住下层的所有点击
     this.trashLayer.close();
     this.spaceLayer.show(this.spaces, this.current?.id ?? '', focusRename);
@@ -1636,6 +1649,7 @@ class App {
       field: this.field,
       performance: () => this.performanceSnapshot(),
       viewport: () => ({ ...this.viewport }),
+      uiState: () => ({ tools: this.tools.isOpen, spaceOverview: this.spaceLayer.isOpen }),
       refresh: () => { this.markSearchDirty(); return this.refreshCurrentSpace({ quiet: true }); },
       spaces: () => this.spaces,
       current: () => this.current,

@@ -18,7 +18,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { seedStress } from './stress-data.mjs';
@@ -178,6 +178,29 @@ async function centerOf(cdp, selector) {
   );
 }
 
+async function click(cdp, selector) {
+  const point = await centerOf(cdp, selector);
+  if (!point) throw new Error(`找不到元素：${selector}`);
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await cdp.send('Input.dispatchMouseEvent', {type, ...point, button: 'left', buttons: type === 'mousePressed' ? 1 : 0, clickCount: 1});
+  }
+  await sleep(80);
+}
+
+async function tap(cdp, selector) {
+  const point = await centerOf(cdp, selector);
+  await cdp.send('Input.dispatchTouchEvent', {type: 'touchStart', touchPoints: [{...point, id: 1}]});
+  await cdp.send('Input.dispatchTouchEvent', {type: 'touchEnd', touchPoints: []});
+  await sleep(100);
+}
+
+async function screenshot(cdp, name) {
+  if (!process.env.SMOKE_SCREENSHOT_DIR) return;
+  await sleep(250);
+  const shot = await cdp.send('Page.captureScreenshot', {format: 'png'});
+  writeFileSync(join(process.env.SMOKE_SCREENSHOT_DIR, `ui-${name}.png`), Buffer.from(shot.data, 'base64'));
+}
+
 /**
  * 用真实鼠标事件拖拽。
  * Chrome 会把这些鼠标事件同时合成为 pointer 事件，所以走的就是应用真实的拖拽链路。
@@ -329,6 +352,10 @@ async function main() {
 
     const ready = await waitUntil(cdp, `document.readyState === 'complete' && !!window.__nebula`);
     ok(ready, '页面加载完成且应用已启动');
+    ok(await evaluate(cdp, `document.querySelector('#tools-panel').hidden && getComputedStyle(document.querySelector('#search')).display !== 'none' && document.querySelector('#search').getClientRects().length === 0`), '工具默认收起，搜索不占据页面');
+    ok(await evaluate(cdp, `document.querySelector('.dock').querySelectorAll('textarea').length === 1 && !document.querySelector('.dock .meta,.dock .searchrow,.dock .sync-bar,.dock .devrow')`), '底部只保留录入与临时提示');
+    ok(await evaluate(cdp, `!window.__nebula.uiState().tools && !window.__nebula.uiState().spaceOverview`), '调试出口显示工具与星图均处于关闭状态');
+    ok(await evaluate(cdp, `document.querySelector('#input').scrollHeight <= document.querySelector('#input').clientHeight + 1`), '空输入栏不出现多余的纵向滚动');
     ok((await evaluate(cdp, `document.title`)) === '想法星云', '页面标题正确');
     ok((await evaluate(cdp, IDEA_COUNT)) === 0, '全新环境没有想法泡泡');
     ok(
@@ -393,7 +420,8 @@ async function main() {
     ok((await evaluate(cdp, HEART_TEXT)) === '未命名 2', '心泡泡换成了新空间的名字');
 
     const spaceB = await evaluate(cdp, `window.__nebula.current().id`);
-
+    // The full-screen map intentionally hides recording while naming a new space.
+    await click(cdp, '#space-close');
     await typeAndEnter(cdp, '深海的压力');
     ok((await evaluate(cdp, IDEA_COUNT)) === 1, '在 B 空间记 1 条 → 只有 1 个泡泡');
 
@@ -459,6 +487,7 @@ async function main() {
 
     await evaluate(cdp, `window.__nebula.openTrash()`);
     await sleep(400);
+    await screenshot(cdp, 'trash');
     const trashCount = await evaluate(cdp, `document.querySelectorAll('.trash-item').length`);
     ok(trashCount === 1, '回收站里有 1 项', String(trashCount));
     const trashMeta = await evaluate(cdp, `document.querySelector('.trash-meta')?.textContent ?? ''`);
@@ -483,8 +512,10 @@ async function main() {
     ok(restoredName === '未命名 2', '恢复时名字没有被多加后缀（此时无冲突）', restoredName);
 
     console.log('\n── 空间切换浮层 UI ──');
-
-    await evaluate(cdp, `document.querySelector('.bubble--heart').click()`);
+    await click(cdp, '#trash-close');
+    await settle(cdp);
+    await screenshot(cdp, 'desktop');
+    await click(cdp, '.bubble--heart');
     await sleep(350);
     ok(
       !(await evaluate(cdp, `document.querySelector('#space-layer').hidden`)),
@@ -494,7 +525,28 @@ async function main() {
       (await evaluate(cdp, `document.querySelectorAll('.space-chip').length`)) === 2,
       '浮层里列出了 2 个空间的心泡泡',
     );
-    await evaluate(cdp, `document.querySelectorAll('.space-chip-main')[1].click()`);
+    ok(await evaluate(cdp, `getComputedStyle(document.querySelector('#world')).visibility === 'hidden' && getComputedStyle(document.querySelector('.dock')).visibility === 'hidden'`), '空间星图只显示中心星体，想法与录入暂时退场');
+    ok(await evaluate(cdp, `(() => { const r = document.querySelector('.space-map').getBoundingClientRect(); return r.width === innerWidth && r.height === innerHeight; })()`), '空间星图覆盖完整视口');
+    await screenshot(cdp, 'spaces');
+    const oldSpaceName = await evaluate(cdp, 'window.__nebula.current().name');
+    await click(cdp, '.space-chip.is-current .space-chip-rename');
+    ok(await evaluate(cdp, `document.activeElement.matches('.space-chip-input')`), '真实点击当前空间的改名入口，输入框获得焦点');
+    await cdp.send('Input.insertText', {text: '中心空间验收'});
+    await cdp.send('Input.dispatchKeyEvent', {type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13});
+    ok(await waitUntil(cdp, `window.__nebula.current().name === '中心空间验收'`), '当前中心空间可以改名');
+    ok(await evaluate(cdp, `window.__nebula.store.getAllSpaces().then(spaces => spaces.some(s => s.name === '中心空间验收'))`), '改名先写入 IndexedDB');
+    await click(cdp, '#space-close');
+    await cdp.send('Page.reload');
+    await sleep(400);
+    await waitUntil(cdp, '!!window.__nebula && document.readyState === "complete"');
+    ok(await evaluate(cdp, `document.querySelector('#world .bubble--heart .bubble-label').textContent === '中心空间验收'`), '刷新后中心泡泡保留新名字');
+    await evaluate(cdp, `window.__nebula.renameSpace(window.__nebula.current().id, ${JSON.stringify(oldSpaceName)})`);
+    await settle(cdp);
+    await click(cdp, '.bubble--heart');
+    await click(cdp, '.space-list');
+    ok(await evaluate(cdp, `document.querySelector('#space-layer').hidden`), '真实点击星图的空白处返回当前空间');
+    await click(cdp, '.bubble--heart');
+    await click(cdp, '.space-chip:nth-child(2) .space-chip-main');
     await sleep(400);
     ok(
       await evaluate(cdp, `document.querySelector('#space-layer').hidden`),
@@ -948,6 +1000,7 @@ async function main() {
       })()`,
     );
     ok(zoomView !== null, '放大态的克隆体已经出现');
+    await screenshot(cdp, 'reading');
     ok(zoomView?.backdrop, '放大时底层有遮罩（点它可以收回）');
     ok(zoomView?.srcHidden, '原泡泡被暂时隐藏（收回时会原地复活）');
 
@@ -1203,6 +1256,7 @@ async function main() {
 
     /** 用真实键盘输入搜索词（会触发真实的 input 事件）。 */
     const typeSearch = async (text) => {
+      if (await evaluate(cdp, `document.querySelector('#tools-panel').hidden`)) await click(cdp, '#tools-toggle');
       await evaluate(
         cdp,
         `(() => { const el = document.querySelector('#search'); el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); })()`,
@@ -1218,6 +1272,7 @@ async function main() {
 
     // ── 搜「三点」 ──
     await typeSearch('三点');
+    await screenshot(cdp, 'search');
     const s1 = await probe();
     ok(s1.hit === 1, `搜「三点」命中 1 条（实际 ${s1.hit}）`);
     ok(s1.count === '⌕ 1 条', `计数文案正确（${s1.count}）`);
@@ -1789,7 +1844,37 @@ async function runStage7(cdp) {
   await cdp.send('Page.navigate', {url: URL_BASE});
   await sleep(500);
   ok(await waitUntil(cdp, '!!window.__nebula && document.readyState === "complete"'), '手机尺寸正常启动');
+  await tap(cdp, '#tools-toggle');
+  ok(await evaluate(cdp, `document.querySelector('#tools-toggle').getAttribute('aria-expanded') === 'true' && !document.querySelector('#tools-panel').hidden`), '手机真实点击展开工具');
+  await screenshot(cdp, 'mobile-tools');
+  await tap(cdp, '#sync-bar');
+  ok(await evaluate(cdp, `!document.querySelector('#sync-layer').hidden && document.querySelector('#tools-panel').hidden`), '手机备份入口打开设置，同时收起工具');
+  await screenshot(cdp, 'mobile-settings');
+  await tap(cdp, '#sync-close');
+  await tap(cdp, '#tools-toggle');
+  await cdp.send('Input.dispatchKeyEvent', {type: 'keyDown', key: 'Escape', windowsVirtualKeyCode: 27});
+  ok(await evaluate(cdp, `document.querySelector('#tools-panel').hidden && document.querySelector('#tools-toggle').getAttribute('aria-expanded') === 'false'`), 'Escape 收起工具，不留下透明遮罩');
+  await settle(cdp);
+  const mapViewport = await evaluate(cdp, 'window.__nebula.viewport()');
+  await tap(cdp, '.bubble--heart');
+  await tap(cdp, '.space-chip-rename');
+  const mobileName = await evaluate(cdp, 'window.__nebula.current().name');
+  await cdp.send('Input.insertText', {text: '手机空间'});
+  await evaluate(cdp, `window.__renameVv = Object.getOwnPropertyDescriptor(visualViewport, 'height'); Object.defineProperty(visualViewport, 'height', {configurable:true, value:innerHeight - 300}); visualViewport.dispatchEvent(new Event('resize'))`);
+  await sleep(150);
+  ok(await evaluate(cdp, `document.querySelector('.space-chip-input').getBoundingClientRect().bottom <= visualViewport.height`), '模拟键盘弹起时，星图中的改名框仍在可视区域');
+  await evaluate(cdp, `delete visualViewport.height; if (window.__renameVv) Object.defineProperty(visualViewport, 'height', window.__renameVv); delete window.__renameVv; visualViewport.dispatchEvent(new Event('resize'))`);
+  await cdp.send('Input.dispatchKeyEvent', {type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 229, isComposing: true});
+  ok(await evaluate(cdp, `!!document.querySelector('.space-chip-input') && window.__nebula.current().name === ${JSON.stringify(mobileName)}`), '改名输入法组字时 Enter 不提前提交');
+  await tap(cdp, '.space-edit .btn');
+  ok(await waitUntil(cdp, `window.__nebula.current().name === '手机空间'`), '手机无需双击，点击改名与保存即可持久化');
+  await screenshot(cdp, 'mobile-spaces');
+  await tap(cdp, '#space-close');
+  ok(await evaluate(cdp, `(() => { const view = window.__nebula.viewport(), stage = document.querySelector('#stage'); return view.tx === ${mapViewport.tx} && view.ty === ${mapViewport.ty} && view.scale === ${mapViewport.scale} && stage.scrollLeft === 0 && stage.scrollTop === 0; })()`), '星图返回不改变想法视口，也不因焦点滚动偏移画布');
+  await evaluate(cdp, `window.__nebula.renameSpace(window.__nebula.current().id, ${JSON.stringify(mobileName)})`);
+  ok(await evaluate(cdp, `document.documentElement.scrollWidth === innerWidth`), '手机页面没有横向溢出');
   await typeAndEnter(cdp, '触屏验证');
+  await screenshot(cdp, 'mobile');
   await settle(cdp);
   await evaluate(cdp, 'window.__nebula.fitAll(); document.activeElement.blur()');
   const target = await centerOf(cdp, '.bubble--idea:not(.bubble--shadow)');
